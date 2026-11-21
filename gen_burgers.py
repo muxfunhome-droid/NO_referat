@@ -79,7 +79,7 @@ if __name__ == "__main__":
     N, n = 1024, int(sys.argv[1]) if len(sys.argv) > 1 else 1200
     u0 = grf(n, N, rng)
     t = time.time()
-    uT = jnp.concatenate([solve(u0[i:i + 200]) for i in range(0, n, 200)])
+    uT = jnp.concatenate([make_solver(u0[i:i + 200]) for i in range(0, n, 200)])
     print("batch solve time", time.time() - t, "max|u0|", jnp.abs(u0).max(), "nan?", jnp.isnan(uT).any())
     # время одного решения нужно для сравнения с FNO
     t = time.time(); solve(u0[:1]); t1 = time.time() - t
