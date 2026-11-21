@@ -76,12 +76,41 @@ def make_solver(N, nu=0.01, T=1.0, dt=1e-4):
 
 if __name__ == "__main__":
     rng = np.random.default_rng(0)
+
     N, n = 1024, int(sys.argv[1]) if len(sys.argv) > 1 else 1200
+
     u0 = grf(n, N, rng)
+
+    # Создаём решатель один раз
+    solve = make_solver(N)
+
     t = time.time()
-    uT = jnp.concatenate([make_solver(u0[i:i + 200]) for i in range(0, n, 200)])
-    print("batch solve time", time.time() - t, "max|u0|", jnp.abs(u0).max(), "nan?", jnp.isnan(uT).any())
-    # время одного решения нужно для сравнения с FNO
-    t = time.time(); solve(u0[:1]); t1 = time.time() - t
+
+    # Решаем батчами по 200 начальных условий
+    uT = jnp.concatenate([
+        solve(u0[i:i + 200])
+        for i in range(0, n, 200)
+    ], axis=0)
+
+    print(
+        "batch solve time",
+        time.time() - t,
+        "max|u0|",
+        jnp.abs(u0).max(),
+        "nan?",
+        jnp.isnan(uT).any()
+    )
+
+    # Время одного решения
+    t = time.time()
+    solve(u0[:1])
+    t1 = time.time() - t
+
     print("single-sample solver time (N=1024):", t1)
-    np.savez_compressed("/home/void/NO/burgers.npz", u0=u0, uT=uT, solver_time=t1)
+
+    np.savez_compressed(
+        "/home/void/NO/burgers.npz",
+        u0=u0,
+        uT=uT,
+        solver_time=t1
+    )
