@@ -60,23 +60,40 @@ def init_cnn(key):
     return [{"w": jax.random.normal(ks[i], (CK, chans[i], chans[i + 1])) / np.sqrt(CK * chans[i]),
              "b": jnp.zeros(chans[i + 1])} for i in range(CL)]
 
+
 def cnn(p, a):
-    out = jnp.zeros(
-        (v.shape[0], v.shape[1], lp["b"].shape[0]),
-        dtype=v.dtype
-    )
+    v = with_grid(a)
 
-    for k in range(CK):
-        xk = vp[:, k * DIL[i]:k * DIL[i] + v.shape[1], :]
+    for i, lp in enumerate(p):
+        pad = (CK // 2) * DIL[i]
 
-        out = out + jnp.einsum(
-            "bni,io->bno",
-            xk,
-            lp["w"][k]
+        # Циклическое дополнение по пространственной координате
+        vp = jnp.concatenate(
+            [v[:, -pad:, :], v, v[:, :pad, :]],
+            axis=1
         )
 
-    v = out + lp["b"]
+        out = jnp.zeros(
+            (v.shape[0], v.shape[1], lp["b"].shape[0]),
+            dtype=v.dtype
+        )
+
+        for k in range(CK):
+            xk = vp[:, k * DIL[i]:k * DIL[i] + v.shape[1], :]
+
+            out = out + jnp.einsum(
+                "bni,io->bno",
+                xk,
+                lp["w"][k]
+            )
+
+        v = out + lp["b"]
+
+        if i < len(p) - 1:
+            v = jax.nn.gelu(v)
+
     return v[..., 0]
+
 
 def rel_l2(pred, y):  # относительная ошибка в L2 по каждому образцу
     return jnp.linalg.norm(pred - y, axis=1) / jnp.linalg.norm(y, axis=1)
