@@ -1,5 +1,6 @@
 import sys
 import time
+import jax
 import jax.numpy as jnp
 from jax import lax
 import numpy as np
