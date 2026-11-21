@@ -1,6 +1,9 @@
 import jax, jax.numpy as jnp, numpy as np, optax, time, json, pickle
+from pathlib import Path
 
-D = np.load("/home/void/project/NO_referat/burgers.npz")
+BASE_DIR = Path(__file__).resolve().parent
+
+D = np.load(BASE_DIR / "burgers.npz")
 u0, uT = D["u0"].astype(np.float32), D["uT"].astype(np.float32)
 NTR, NTE = 1000, 100  # размеры обучающей и тестовой выборок
 FULL = u0.shape[1]
@@ -113,7 +116,7 @@ def evaluate(model, params, res):  # средняя ошибка на тесто
 
 if __name__ == "__main__":
     import os, sys
-    out = json.load(open("/home/void/project/NO_referat/results.json")) if os.path.exists("/home/void/NO/results.json") else {}
+    out = json.load(open(BASE_DIR / "results.json")) if os.path.exists(BASE_DIR / "results.json") else {}
     # без аргументов обучаются обе модели, можно передать только FNO или только CNN
     todo = sys.argv[1:] or ["FNO", "CNN"]
     for name, model, init in [("FNO", fno, init_fno), ("CNN", cnn, init_cnn)]:
@@ -124,14 +127,14 @@ if __name__ == "__main__":
                      "test": {r: evaluate(model, p, r) for r in [64, 128, 256, 512, 1024]},
                      "nparams": int(sum(x.size for x in jax.tree_util.tree_leaves(p)))}
         print(name, out[name]["test"], out[name]["nparams"], out[name]["train_time"], flush=True)
-        pickle.dump(jax.device_get(p), open(f"/home/void/projetc/NO_referat/{name}.pkl", "wb"))
+        pickle.dump(jax.device_get(p), open(BASE_DIR / f"{name}.pkl", "wb"))
     # время одного прохода FNO на сетке 1024 (после прогрева jit), среднее по 100 запускам
-    p = pickle.load(open("/home/void/project/NO_referat/FNO.pkl", "rb"))
+    p = pickle.load(open(BASE_DIR / "FNO.pkl", "rb"))
     f = jax.jit(fno); x1 = jnp.array(u0[NTR:NTR + 1]); f(p, x1).block_until_ready()
     t = time.time()
     for _ in range(100):
         f(p, x1).block_until_ready()
     out["fno_infer_time_1024"] = (time.time() - t) / 100
     out["solver_time_1024"] = float(D["solver_time"])
-    json.dump(out, open("/home/void/project/NO_referat/results.json", "w"), indent=1)
+    json.dump(out, open(BASE_DIR / "results.json", "w"), indent=1)
     print({k: v for k, v in out.items() if k not in ("FNO", "CNN")})

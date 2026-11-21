@@ -1,9 +1,13 @@
 import sys
 import time
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
-from jax import lax
 import numpy as np
+from jax import lax
+
+BASE_DIR = Path(__file__).resolve().parent
 
 def grf(n_samples, N, rng, alpha=2.0, tau=5.0, sigma=25.0):
     k = np.fft.rfftfreq(N, d=1.0 / N)  # целые волновые числа 0..N/2
@@ -110,7 +114,7 @@ if __name__ == "__main__":
     print("single-sample solver time (N=1024):", t1)
 
     np.savez_compressed(
-        "/home/void/NO/burgers.npz",
+        BASE_DIR / "burgers.npz",
         u0=u0,
         uT=uT,
         solver_time=t1
