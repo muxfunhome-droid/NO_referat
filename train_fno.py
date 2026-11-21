@@ -58,14 +58,21 @@ def init_cnn(key):
              "b": jnp.zeros(chans[i + 1])} for i in range(CL)]
 
 def cnn(p, a):
-    v = with_grid(a)
-    for i, lp in enumerate(p):
-        pad = (CK // 2) * DIL[i]
-        vp = jnp.concatenate([v[:, -pad:], v, v[:, :pad]], 1)  # периодическое дополнение краёв
-        v = jax.lax.conv_general_dilated(vp, lp["w"], (1,), "VALID", rhs_dilation=(DIL[i],),
-                                         dimension_numbers=("NWC", "WIO", "NWC")) + lp["b"]
-        if i < CL - 1:
-            v = jax.nn.gelu(v)
+    out = jnp.zeros(
+        (v.shape[0], v.shape[1], lp["b"].shape[0]),
+        dtype=v.dtype
+    )
+
+    for k in range(CK):
+        xk = vp[:, k * DIL[i]:k * DIL[i] + v.shape[1], :]
+
+        out = out + jnp.einsum(
+            "bni,io->bno",
+            xk,
+            lp["w"][k]
+        )
+
+    v = out + lp["b"]
     return v[..., 0]
 
 def rel_l2(pred, y):  # относительная ошибка в L2 по каждому образцу
@@ -86,7 +93,14 @@ def train(model, params, res=256, epochs=300, bs=20, lr=1e-3, seed=0):
     for ep in range(epochs):
         idx = rng.permutation(NTR); ls = []
         for i in range(0, NTR, bs):
-            params, st, l = step(params, st, xtr[idx[i:i + bs]], ytr[idx[i:i + bs]])
+            params, st, l = step(
+                params,
+                st,
+                xtr[idx[i:i + bs]],
+                ytr[idx[i:i + bs]]
+            )
+
+            l.block_until_ready()
             ls.append(float(l))
         hist.append(float(np.mean(ls)))
         if ep % 50 == 0 or ep == epochs - 1:
