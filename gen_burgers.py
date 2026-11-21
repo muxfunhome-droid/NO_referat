@@ -14,26 +14,65 @@ def grf(n_samples, N, rng, alpha=2.0, tau=5.0, sigma=25.0):
     u_hat = coef * xi * N / jnp.sqrt(2)
     return np.fft.irfft(u_hat, n=N)
 
-@jax.jit
-def solve(u0, nu=0.01, T=1.0, dt=1e-4):
-    N = u0.shape[-1]
+def make_solver(N, nu=0.01, T=1.0, dt=1e-4):
+
+    # Волновые числа
     k = 2 * jnp.pi * jnp.fft.rfftfreq(N, d=1.0 / N)
-    L = -nu * k ** 2  # линейная часть (вязкость), в спектральном пространстве диагональна
-    # деалиасинг по правилу 2/3: обрезаем старшие гармоники перед возведением в квадрат
-    dealias = jnp.abs(jnp.fft.rfftfreq(N, d=1.0 / N)) < (N // 3)
-    def Nl(vh):  # нелинейный член -(u^2/2)_x
-        u = jnp.fft.irfft(vh * dealias, n=N)
-        return -0.5j * k * jnp.fft.rfft(u * u)
-    # интегрирующий множитель: вязкая часть решается точно, RK4 берёт только нелинейную
-    E, E2 = jnp.exp(L * dt), jnp.exp(L * dt / 2)
-    vh = jnp.fft.rfft(u0)
-    for _ in range(int(round(T / dt))):
+
+    # Линейная часть уравнения
+    L = -nu * k**2
+
+    # Dealiasing
+    dealias = (
+        jnp.abs(jnp.fft.rfftfreq(N, d=1.0 / N)) < (N // 3)
+    )
+
+    # Интегрирующий множитель
+    E = jnp.exp(L * dt)
+    E2 = jnp.exp(L * dt / 2)
+
+    # Нелинейная часть
+    def Nl(vh):
+        u = jnp.fft.irfft(vh * dealias, n=N, axis=-1)
+        return -0.5j * k * jnp.fft.rfft(u * u, axis=-1)
+
+    n_steps = int(round(T / dt))
+
+    # Один временной шаг
+    def step(i, vh):
+
         a = Nl(vh)
+
         b = Nl(E2 * (vh + dt / 2 * a))
+
         c = Nl(E2 * vh + dt / 2 * b)
+
         d = Nl(E * vh + dt * E2 * c)
-        vh = E * vh + dt / 6 * (E * a + 2 * E2 * (b + c) + d)
-    return jnp.fft.irfft(vh, n=N)
+
+        vh_new = E * vh + dt / 6 * (
+            E * a + 2 * E2 * (b + c) + d
+        )
+
+        return vh_new
+
+    # Полный решатель
+    @jax.jit
+    def solve_batch(u0):
+
+        vh = jnp.fft.rfft(u0, axis=-1)
+
+        vh = lax.fori_loop(
+            0,
+            n_steps,
+            step,
+            vh
+        )
+
+        uT = jnp.fft.irfft(vh, n=N, axis=-1)
+
+        return uT
+
+    return solve_batch
 
 if __name__ == "__main__":
     rng = np.random.default_rng(0)
