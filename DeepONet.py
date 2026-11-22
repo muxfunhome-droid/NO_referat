@@ -32,7 +32,7 @@ def init_mlp(key, sizes):
         )*jnp.sqrt(2)
         b = jnp.zeros(fan_out,)
         params.append((W, b))
-        return params
+    return params
 
 def brach_apply(params, x):
     for i, (W, b) in enumerate(params):
