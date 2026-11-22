@@ -115,6 +115,38 @@ test_loss = loss_fn(
     target_test
 )
 
+# 1024 координаты исходной сетки
+x_1024 = np.linspace(
+    0.0, 1.0, 1024,
+    endpoint=False,
+    dtype=np.float32
+)
+
+trunk_1024 = jnp.asarray(x_1024).reshape(1024, 1)
+
+# Все тестовые примеры: те же индексы, что использовались при split
+branch_test = branch_input[NTR:NTR + NTE]
+target_test_1024 = jnp.asarray(
+    uT[NTR:NTR + NTE],
+    dtype=jnp.float32
+)
+
+# Предсказание для всей тестовой выборки
+prediction_test_1024 = deeponet_apply(
+    params,
+    branch_test,
+    trunk_1024
+)
+
+# Общий MSE
+test_loss_1024 = jnp.mean(
+    (prediction_test_1024 - target_test_1024) ** 2
+)
+
+print("Prediction shape:", prediction_test_1024.shape)
+print("Target shape:", target_test_1024.shape)
+print("Test MSE (1024 points):", float(test_loss_1024))
+
 print("Test loss:", test_loss)
 
 print("Initial loss:", initial_loss)
