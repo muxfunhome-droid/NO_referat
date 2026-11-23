@@ -1,8 +1,12 @@
+import argparse
 import json
-import math
+import os
+import pickle
 import time
 from functools import partial
 from pathlib import Path
+
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import jax
 import jax.numpy as jnp
@@ -11,1093 +15,624 @@ import optax
 from jax import lax
 
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "dataset_ns_128"
+CHECKPOINT_PATH = BASE_DIR / "FNO.pkl"
+WIDTH, MODES1, MODES2, LAYERS = 32, 16, 16, 4
+PROJ = 128
 
-DATA_DIR = Path("dataset_ns_256")
-OUTPUT_DIR = Path("fno_ns_results_256")
-
-SEED = 42
-
-WIDTH = 32
-MODES = 24
-LAYERS = 4
-
-BATCH_SIZE = 8
-TEST_BATCH_SIZE = 8
-
-EPOCHS = 100
-MAX_STEPS_PER_EPOCH = 500
-PATIENCE = 15
-
+EPOCHS = 150
+BATCH_SIZE = 4
 LEARNING_RATE = 1e-3
-WEIGHT_DECAY = 1e-4
-WARMUP_FRACTION = 0.05
+WEIGHT_DECAY = 1e-5
+GRAD_CLIP = 1.0
+PAIRS_PER_EPOCH = 1024
+VAL_PAIRS_PER_EPOCH = 512
+ROLLOUT_CHECK_EVERY = 10
+ROLLOUT_VAL_SAMPLES = 1
 
-BETA1 = 0.9
-BETA2 = 0.999
-ADAM_EPS = 1e-8
-
-MAX_GRAD_NORM = 1.0
-
-ROLLOUT_HORIZONS = [1, 10, 25, 50, 100]
-
-
-# ============================================================
-# FNO MODEL
-# ============================================================
-
-def init_dense(key, in_features, out_features):
-    limit = math.sqrt(6.0 / (in_features + out_features))
-
-    weight = jax.random.uniform(
-        key,
-        (in_features, out_features),
-        minval=-limit,
-        maxval=limit,
-        dtype=jnp.float32
-    )
-
-    bias = jnp.zeros((out_features,), dtype=jnp.float32)
-
-    return weight, bias
-
-
-def init_complex(key, shape, scale):
-    key_real, key_imag = jax.random.split(key)
-
-    real = jax.random.normal(key_real, shape, dtype=jnp.float32)
-    imag = jax.random.normal(key_imag, shape, dtype=jnp.float32)
-
-    return ((real + 1j * imag) * scale).astype(jnp.complex64)
+MODEL_CONFIG = {
+    "width": WIDTH,
+    "modes1": MODES1,
+    "modes2": MODES2,
+    "layers": LAYERS,
+    "projection": PROJ,
+    "input_channels": 1,
+    "output_channels": 1,
+}
 
 
 def init_fno(key):
-    keys = jax.random.split(key, 2 + LAYERS * 3 + 2)
-    index = 0
+    ks = jax.random.split(key, 3 + 5 * LAYERS)
 
-    # Vorticity + x + y coordinates
-    lift_w, lift_b = init_dense(keys[index], 3, WIDTH)
-    index += 1
+    p = {
+        "P": jax.random.normal(ks[0], (1, WIDTH)) / np.sqrt(1),
+        "Pb": jnp.zeros(WIDTH),
+        "Q1": jax.random.normal(ks[1], (WIDTH, PROJ)) / np.sqrt(WIDTH),
+        "Q1b": jnp.zeros(PROJ),
+        "Q2": 1e-3 * jax.random.normal(ks[2], (PROJ, 1)) / np.sqrt(PROJ),
+        "Q2b": jnp.zeros(1),
+        "L": [],
+    }
 
-    spec_scale = 1.0 / (math.sqrt(WIDTH * WIDTH) * math.sqrt(2.0))
-    layers = []
+    sc = 1.0 / (WIDTH * WIDTH)
 
-    for _ in range(LAYERS):
-        w_pos = init_complex(
-            keys[index],
-            (MODES, MODES, WIDTH, WIDTH),
-            spec_scale
-        )
-        index += 1
-
-        w_neg = init_complex(
-            keys[index],
-            (MODES, MODES, WIDTH, WIDTH),
-            spec_scale
-        )
-        index += 1
-
-        local_w, local_b = init_dense(
-            keys[index],
-            WIDTH,
-            WIDTH
-        )
-        index += 1
-
-        layers.append({
-            "w_pos": w_pos,
-            "w_neg": w_neg,
-            "local_w": local_w,
-            "local_b": local_b
+    for l in range(LAYERS):
+        k = 3 + 5 * l
+        p["L"].append({
+            "R1r": sc * jax.random.uniform(
+                ks[k], (MODES1, MODES2, WIDTH, WIDTH), minval=-1.0, maxval=1.0
+            ),
+            "R1i": sc * jax.random.uniform(
+                ks[k + 1], (MODES1, MODES2, WIDTH, WIDTH), minval=-1.0, maxval=1.0
+            ),
+            "R2r": sc * jax.random.uniform(
+                ks[k + 2], (MODES1, MODES2, WIDTH, WIDTH), minval=-1.0, maxval=1.0
+            ),
+            "R2i": sc * jax.random.uniform(
+                ks[k + 3], (MODES1, MODES2, WIDTH, WIDTH), minval=-1.0, maxval=1.0
+            ),
+            "W": jax.random.normal(ks[k + 4], (WIDTH, WIDTH)) / np.sqrt(WIDTH),
+            "b": jnp.zeros(WIDTH),
         })
 
-    proj1_w, proj1_b = init_dense(
-        keys[index],
-        WIDTH,
-        WIDTH * 2
-    )
-    index += 1
-
-    # Initially predict zero increment
-    proj2_w = jnp.zeros(
-        (WIDTH * 2, 1),
-        dtype=jnp.float32
-    )
-    proj2_b = jnp.zeros((1,), dtype=jnp.float32)
-
-    return {
-        "lift_w": lift_w,
-        "lift_b": lift_b,
-        "layers": layers,
-        "proj1_w": proj1_w,
-        "proj1_b": proj1_b,
-        "proj2_w": proj2_w,
-        "proj2_b": proj2_b
-    }
+    return p
 
 
-def dense(x, weight, bias):
-    return jnp.einsum("...i,io->...o", x, weight) + bias
+def spectral_conv2d(lp, v):
+    n1, n2 = v.shape[1], v.shape[2]
 
+    vh = jnp.fft.rfft2(v, axes=(1, 2))
+    out = jnp.zeros_like(vh)
 
-def spectral_conv(x, w_pos, w_neg):
-    batch, nx, ny, channels = x.shape
+    R1 = lp["R1r"] + 1j * lp["R1i"]
+    R2 = lp["R2r"] + 1j * lp["R2i"]
 
-    x_ft = jnp.fft.rfft2(
-        x,
-        axes=(1, 2)
+    out1 = jnp.einsum(
+        "bxyc,xyco->bxyo",
+        vh[:, :MODES1, :MODES2, :],
+        R1,
     )
 
-    out_ft = jnp.zeros(
-        (batch, nx, ny // 2 + 1, channels),
-        dtype=jnp.complex64
+    out2 = jnp.einsum(
+        "bxyc,xyco->bxyo",
+        vh[:, -MODES1:, :MODES2, :],
+        R2,
     )
 
-    positive = jnp.einsum(
-        "bxyi,xyio->bxyo",
-        x_ft[:, :MODES, :MODES, :],
-        w_pos
-    )
+    out = out.at[:, :MODES1, :MODES2, :].set(out1)
+    out = out.at[:, -MODES1:, :MODES2, :].set(out2)
 
-    negative = jnp.einsum(
-        "bxyi,xyio->bxyo",
-        x_ft[:, -MODES:, :MODES, :],
-        w_neg
-    )
+    return jnp.fft.irfft2(out, s=(n1, n2), axes=(1, 2))
 
-    out_ft = out_ft.at[:, :MODES, :MODES, :].set(positive)
-    out_ft = out_ft.at[:, -MODES:, :MODES, :].set(negative)
 
-    return jnp.fft.irfft2(
-        out_ft,
-        s=(nx, ny),
-        axes=(1, 2)
-    )
+def fno(p, a):
+    v = a[..., None] @ p["P"] + p["Pb"]
 
+    for l, lp in enumerate(p["L"]):
+        v = spectral_conv2d(lp, v) + v @ lp["W"] + lp["b"]
 
-def make_grid(nx, ny):
-    grid_x = jnp.linspace(
-        0.0, 1.0, nx,
-        endpoint=False,
-        dtype=jnp.float32
-    )
+        if l < LAYERS - 1:
+            v = jax.nn.gelu(v)
 
-    grid_y = jnp.linspace(
-        0.0, 1.0, ny,
-        endpoint=False,
-        dtype=jnp.float32
-    )
+    h = jax.nn.gelu(v @ p["Q1"] + p["Q1b"])
+    delta = (h @ p["Q2"] + p["Q2b"])[..., 0]
+    return a + delta
 
-    gx, gy = jnp.meshgrid(
-        grid_x,
-        grid_y,
-        indexing="ij"
-    )
 
-    return jnp.stack([gx, gy], axis=-1)
+def rel_l2(pred, y):
+    num = jnp.linalg.norm(pred - y, axis=(1, 2))
+    den = jnp.linalg.norm(y, axis=(1, 2)) + 1e-8
+    return num / den
 
 
-def fno_apply(params, x, grid):
-    batch, nx, ny, _ = x.shape
+@jax.jit
+def eval_step(params, x, y):
+    return rel_l2(fno(params, x), y)
 
-    grid_b = jnp.broadcast_to(
-        grid[None, ...],
-        (batch, nx, ny, 2)
-    )
 
-    h = jnp.concatenate([x, grid_b], axis=-1)
+def load_dataset(data_dir):
+    data_path = data_dir / "trajectories.npy"
 
-    # Lifting
-    h = dense(
-        h,
-        params["lift_w"],
-        params["lift_b"]
-    )
-
-    # Residual Fourier blocks
-    for layer in params["layers"]:
-        spectral = spectral_conv(
-            h,
-            layer["w_pos"],
-            layer["w_neg"]
-        )
-
-        local = dense(
-            h,
-            layer["local_w"],
-            layer["local_b"]
-        )
-
-        update = jax.nn.gelu(spectral + local)
-        h = h + 0.1 * update
-
-    # Projection
-    h = jax.nn.gelu(
-        dense(
-            h,
-            params["proj1_w"],
-            params["proj1_b"]
-        )
-    )
-
-    # Predict normalized increment
-    delta = dense(
-        h,
-        params["proj2_w"],
-        params["proj2_b"]
-    )
-
-    return delta
-
-
-def count_parameters(params):
-    total = 0
-
-    for leaf in jax.tree_util.tree_leaves(params):
-        multiplier = 2 if jnp.iscomplexobj(leaf) else 1
-        total += leaf.size * multiplier
-
-    return int(total)
-
-
-# ============================================================
-# LOSS
-# ============================================================
-
-def relative_l2(prediction, target):
-    error = prediction - target
-
-    error_norm = jnp.linalg.norm(
-        error.reshape(error.shape[0], -1),
-        axis=1
-    )
-
-    target_norm = jnp.linalg.norm(
-        target.reshape(target.shape[0], -1),
-        axis=1
-    )
-
-    return error_norm / jnp.maximum(target_norm, 1e-12)
-
-
-# ============================================================
-# OPTAX TRAINING
-# ============================================================
-
-def make_train_step(optimizer, grid):
-
-    @jax.jit
-    def train_step(
-        params,
-        optimizer_state,
-        x,
-        y,
-        data_mean,
-        data_std
-    ):
-        x_norm = (x - data_mean) / data_std
-        y_norm = (y - data_mean) / data_std
-
-        def loss_function(current_params):
-            delta = fno_apply(current_params, x_norm, grid)
-            prediction = x_norm + delta
-            return jnp.mean(relative_l2(prediction, y_norm))
-
-        loss, grads = jax.value_and_grad(loss_function)(params)
-        grad_norm = optax.global_norm(grads)
-
-        updates, optimizer_state = optimizer.update(
-            grads,
-            optimizer_state,
-            params
-        )
-
-        params = optax.apply_updates(params, updates)
-
-        return params, optimizer_state, loss, grad_norm
-
-    return train_step
-
-
-def make_validation_step(grid):
-
-    @jax.jit
-    def validation_step(params, x, y, data_mean, data_std):
-        x_norm = (x - data_mean) / data_std
-        y_norm = (y - data_mean) / data_std
-        prediction = x_norm + fno_apply(params, x_norm, grid)
-        return jnp.mean(relative_l2(prediction, y_norm))
-
-    return validation_step
-
-
-def make_predict_physical(grid):
-
-    @jax.jit
-    def predict_physical(params, x, data_mean, data_std):
-        x_norm = (x - data_mean) / data_std
-        delta = fno_apply(params, x_norm, grid)
-        prediction_norm = x_norm + delta
-        return prediction_norm * data_std + data_mean
-
-    return predict_physical
-
-
-def make_rollout_fn(grid):
-
-    @partial(jax.jit, static_argnames=("n_steps",))
-    def autoregressive_rollout(
-        params,
-        initial,
-        data_mean,
-        data_std,
-        n_steps
-    ):
-        state = (initial - data_mean) / data_std
-
-        def body(current_state, _):
-            delta = fno_apply(params, current_state, grid)
-            next_state = current_state + delta
-            return next_state, next_state
-
-        _, predictions = lax.scan(
-            body,
-            state,
-            None,
-            length=n_steps
-        )
-
-        return predictions * data_std + data_mean
-
-    return autoregressive_rollout
-
-
-# ============================================================
-# DATA HELPERS
-# ============================================================
-
-def make_pairs(sample_ids, n_transitions):
-    return np.asarray(
-        [
-            (int(sample_id), time_id)
-            for sample_id in sample_ids
-            for time_id in range(n_transitions)
-        ],
-        dtype=np.int32
-    )
-
-
-def get_batch(data, pairs):
-    x = np.asarray(
-        data[pairs[:, 0], pairs[:, 1]],
-        dtype=np.float32
-    )
-
-    y = np.asarray(
-        data[pairs[:, 0], pairs[:, 1] + 1],
-        dtype=np.float32
-    )
-
-    if not (np.isfinite(x).all() and np.isfinite(y).all()):
-        raise FloatingPointError("Non-finite values found in dataset batch")
-
-    return (
-        jnp.asarray(x[..., None]),
-        jnp.asarray(y[..., None])
-    )
-
-
-def calculate_normalization(data, train_ids):
-    total_sum = 0.0
-    total_squared_sum = 0.0
-    total_count = 0
-
-    for sample_id in train_ids:
-        trajectory = np.asarray(
-            data[int(sample_id)],
-            dtype=np.float64
-        )
-
-        total_sum += float(np.sum(trajectory))
-        total_squared_sum += float(np.sum(trajectory ** 2))
-        total_count += trajectory.size
-
-    data_mean = total_sum / total_count
-    variance = max((total_squared_sum / total_count) - (data_mean ** 2), 1e-12)
-    data_std = math.sqrt(variance)
-
-    return np.float32(data_mean), np.float32(data_std)
-
-
-def save_params(params, path):
-    leaves, _ = jax.tree_util.tree_flatten(params)
-
-    arrays = {
-        f"arr_{index}": np.asarray(jax.device_get(value))
-        for index, value in enumerate(leaves)
-    }
-
-    np.savez(path, **arrays)
-
-
-def evaluate_validation(
-    validation_step_fn,
-    params,
-    data,
-    pairs,
-    data_mean,
-    data_std
-):
-    total_loss = 0.0
-    total_samples = 0
-
-    for start in range(0, len(pairs), BATCH_SIZE):
-        batch_pairs = pairs[start:start + BATCH_SIZE]
-        x, y = get_batch(data, batch_pairs)
-
-        loss = validation_step_fn(
-            params,
-            x,
-            y,
-            data_mean,
-            data_std
-        )
-
-        batch_count = len(batch_pairs)
-        total_loss += float(jax.device_get(loss)) * batch_count
-        total_samples += batch_count
-
-    return total_loss / total_samples
-
-
-# ============================================================
-# ONE-STEP TEST
-# ============================================================
-
-def test_one_step(
-    predict_fn,
-    params,
-    data,
-    pairs,
-    data_mean,
-    data_std
-):
-    relative_errors = []
-    baseline_relative_errors = []
-
-    squared_error_sum = 0.0
-    absolute_error_sum = 0.0
-    baseline_squared_error_sum = 0.0
-
-    element_count = 0
-
-    for start in range(0, len(pairs), TEST_BATCH_SIZE):
-        batch_pairs = pairs[start:start + TEST_BATCH_SIZE]
-        x, y = get_batch(data, batch_pairs)
-
-        prediction = np.asarray(
-            jax.device_get(predict_fn(params, x, data_mean, data_std))
-        )[..., 0]
-
-        x_np = np.asarray(jax.device_get(x))[..., 0]
-        y_np = np.asarray(jax.device_get(y))[..., 0]
-
-        error = prediction - y_np
-        baseline_error = x_np - y_np
-
-        pred_norm = np.linalg.norm(
-            error.reshape(len(batch_pairs), -1),
-            axis=1
-        )
-
-        target_norm = np.linalg.norm(
-            y_np.reshape(len(batch_pairs), -1),
-            axis=1
-        )
-
-        base_norm = np.linalg.norm(
-            baseline_error.reshape(len(batch_pairs), -1),
-            axis=1
-        )
-
-        denominator = np.maximum(target_norm, 1e-12)
-
-        relative_errors.extend((pred_norm / denominator).tolist())
-        baseline_relative_errors.extend((base_norm / denominator).tolist())
-
-        squared_error_sum += float(np.sum(error ** 2))
-        absolute_error_sum += float(np.sum(np.abs(error)))
-        baseline_squared_error_sum += float(np.sum(baseline_error ** 2))
-
-        element_count += error.size
-
-    return {
-        "pairs": int(len(relative_errors)),
-        "rmse": float(math.sqrt(squared_error_sum / element_count)),
-        "mae": float(absolute_error_sum / element_count),
-        "relative_l2_mean": float(np.mean(relative_errors)),
-        "relative_l2_std": float(np.std(relative_errors)),
-        "persistence_baseline_rmse": float(
-            math.sqrt(baseline_squared_error_sum / element_count)
-        ),
-        "persistence_baseline_relative_l2_mean": float(
-            np.mean(baseline_relative_errors)
-        ),
-        "relative_l2_ratio_to_baseline": float(
-            np.mean(relative_errors)
-            / max(np.mean(baseline_relative_errors), 1e-12)
-        )
-    }
-
-
-# ============================================================
-# AUTOREGRESSIVE ROLLOUT TEST
-# ============================================================
-
-def test_rollout(
-    rollout_fn,
-    params,
-    data,
-    test_ids,
-    data_mean,
-    data_std,
-    n_steps
-):
-    model_errors = []
-    baseline_errors = []
-
-    for sample_id in test_ids:
-        initial_np = np.asarray(
-            data[int(sample_id), 0],
-            dtype=np.float32
-        )
-
-        true_trajectory = np.asarray(
-            data[int(sample_id), 1:n_steps + 1],
-            dtype=np.float32
-        )
-
-        initial = jnp.asarray(initial_np[None, :, :, None])
-
-        prediction = np.asarray(
-            jax.device_get(
-                rollout_fn(
-                    params,
-                    initial,
-                    data_mean,
-                    data_std,
-                    n_steps=n_steps
-                )
-            )
-        )[:, 0, :, :, 0]
-
-        model_difference = prediction - true_trajectory
-        baseline_prediction = np.broadcast_to(initial_np, true_trajectory.shape)
-        baseline_difference = baseline_prediction - true_trajectory
-
-        target_norm = np.linalg.norm(
-            true_trajectory.reshape(n_steps, -1),
-            axis=1
-        )
-        denominator = np.maximum(target_norm, 1e-12)
-
-        model_norm = np.linalg.norm(
-            model_difference.reshape(n_steps, -1),
-            axis=1
-        )
-        baseline_norm = np.linalg.norm(
-            baseline_difference.reshape(n_steps, -1),
-            axis=1
-        )
-
-        model_errors.append(model_norm / denominator)
-        baseline_errors.append(baseline_norm / denominator)
-
-    model_errors = np.asarray(model_errors, dtype=np.float64)
-    baseline_errors = np.asarray(baseline_errors, dtype=np.float64)
-
-    model_mean = np.mean(model_errors, axis=0)
-    model_std = np.std(model_errors, axis=0)
-
-    baseline_mean = np.mean(baseline_errors, axis=0)
-    baseline_std = np.std(baseline_errors, axis=0)
-
-    selected_horizons = {}
-
-    for horizon in ROLLOUT_HORIZONS:
-        index = horizon - 1
-        selected_horizons[str(horizon)] = {
-            "fno_relative_l2_mean": float(model_mean[index]),
-            "fno_relative_l2_std": float(model_std[index]),
-            "persistence_relative_l2_mean": float(baseline_mean[index]),
-            "persistence_relative_l2_std": float(baseline_std[index])
-        }
-
-    return {
-        "trajectories": int(len(test_ids)),
-        "steps": int(n_steps),
-        "selected_horizons": selected_horizons,
-        "fno_relative_l2_mean_by_step": model_mean.tolist(),
-        "fno_relative_l2_std_by_step": model_std.tolist(),
-        "persistence_relative_l2_mean_by_step": baseline_mean.tolist(),
-        "persistence_relative_l2_std_by_step": baseline_std.tolist(),
-        "final_horizon_relative_l2_mean": float(model_mean[-1]),
-        "final_horizon_relative_l2_std": float(model_std[-1]),
-        "final_horizon_persistence_relative_l2_mean": float(
-            baseline_mean[-1]
-        )
-    }, model_errors, baseline_errors
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-    if not DATA_DIR.exists():
-        raise FileNotFoundError(f"Dataset directory not found: {DATA_DIR}")
-
-    data_path = DATA_DIR / "trajectories.npy"
-    train_path = DATA_DIR / "train_indices.npy"
-    val_path = DATA_DIR / "val_indices.npy"
-    test_path = DATA_DIR / "test_indices.npy"
-
-    for path in [data_path, train_path, val_path, test_path]:
-        if not path.exists():
-            raise FileNotFoundError(f"Required dataset file not found: {path}")
+    if not data_path.exists():
+        raise FileNotFoundError(f"Dataset not found: {data_path}")
 
     data = np.load(data_path, mmap_mode="r")
 
     if data.ndim != 4:
-        raise ValueError(f"Expected 4D dataset, received shape {data.shape}")
+        raise ValueError(
+            f"Expected trajectories with 4 dimensions, got shape {data.shape}"
+        )
 
-    n_samples, n_snapshots, nx, ny = data.shape
+    if data.dtype != np.float32:
+        raise ValueError(f"Expected float32 dataset, got {data.dtype}")
 
-    if nx != 256 or ny != 256:
-        raise ValueError(f"Expected 256x256 dataset, received {nx}x{ny}")
+    train_ids = np.load(data_dir / "train_indices.npy")
+    val_ids = np.load(data_dir / "val_indices.npy")
+    test_ids = np.load(data_dir / "test_indices.npy")
 
-    if 2 * MODES >= nx or MODES > ny // 2 + 1:
-        raise ValueError("MODES is too large for dataset resolution")
+    if data.shape[1] < 2:
+        raise ValueError("Each trajectory must contain at least two snapshots")
 
-    if n_snapshots - 1 < max(ROLLOUT_HORIZONS):
-        raise ValueError("Not enough snapshots for requested rollout horizons")
+    n = data.shape[-1]
 
-    train_ids = np.load(train_path).astype(np.int32)
-    val_ids = np.load(val_path).astype(np.int32)
-    test_ids = np.load(test_path).astype(np.int32)
+    if data.shape[-2] != n:
+        raise ValueError(f"Expected square spatial grids, got {data.shape[-2:]}")
 
-    all_ids = np.concatenate([train_ids, val_ids, test_ids])
+    if 2 * MODES1 > n or MODES2 > n // 2 + 1:
+        raise ValueError(
+            f"Fourier modes ({MODES1}, {MODES2}) do not fit grid size {n}"
+        )
 
-    if len(np.unique(all_ids)) != n_samples or len(all_ids) != n_samples:
-        raise ValueError("Dataset splits overlap or do not cover all trajectories")
+    return data, train_ids, val_ids, test_ids
 
-    if len(train_ids) == 0 or len(val_ids) == 0 or len(test_ids) == 0:
-        raise ValueError("Train, validation and test splits must be nonempty")
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+def make_pair_batch(data, trajectory_ids, pair_indices, n_transitions):
+    local_sample_ids = pair_indices // n_transitions
+    time_ids = pair_indices % n_transitions
+    sample_ids = trajectory_ids[local_sample_ids]
 
-    print("\n" + "=" * 65)
-    print("FNO-2D TRAINING AND TESTING")
-    print("=" * 65)
+    x = np.asarray(data[sample_ids, time_ids], dtype=np.float32)
+    y = np.asarray(data[sample_ids, time_ids + 1], dtype=np.float32)
 
-    print("Backend:", jax.default_backend())
-    print("Devices:", jax.devices())
-    print("Dataset shape:", data.shape)
-    print("Train trajectories:", len(train_ids))
-    print("Validation trajectories:", len(val_ids))
-    print("Test trajectories:", len(test_ids))
-    print("Resolution:", f"{nx}x{ny}")
-    print("FNO width:", WIDTH)
-    print("FNO modes:", MODES)
-    print("FNO layers:", LAYERS)
-    print("Batch size:", BATCH_SIZE)
+    return jnp.asarray(x), jnp.asarray(y)
 
-    if jax.default_backend() != "gpu":
-        print("WARNING: JAX is not using a GPU backend.")
 
-    grid = make_grid(nx, ny)
+def save_checkpoint(path, params, epoch, val_loss, history):
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    # --------------------------------------------------------
-    # NORMALIZATION
-    # --------------------------------------------------------
+    payload = {
+        "params": jax.device_get(params),
+        "model_config": MODEL_CONFIG,
+        "epoch": int(epoch),
+        "val_loss": float(val_loss),
+        "history": history,
+    }
 
-    data_mean_np, data_std_np = calculate_normalization(data, train_ids)
-    data_mean = jnp.asarray(data_mean_np, dtype=jnp.float32)
-    data_std = jnp.asarray(data_std_np, dtype=jnp.float32)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
 
-    print("Data mean:", float(data_mean_np))
-    print("Data std:", float(data_std_np))
+    with open(temp_path, "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-    # --------------------------------------------------------
-    # DATA PAIRS
-    # --------------------------------------------------------
+    temp_path.replace(path)
 
-    n_transitions = n_snapshots - 1
 
-    train_pairs = make_pairs(train_ids, n_transitions)
-    val_pairs = make_pairs(val_ids, n_transitions)
-    test_pairs = make_pairs(test_ids, n_transitions)
+def load_checkpoint(path):
+    if not path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
 
-    rng = np.random.default_rng(SEED)
+    with open(path, "rb") as f:
+        payload = pickle.load(f)
 
-    max_possible_steps = len(train_pairs) // BATCH_SIZE
-    if max_possible_steps < 1:
-        raise ValueError("Not enough training pairs for one batch")
+    if isinstance(payload, dict) and "params" in payload:
+        config = payload.get("model_config")
 
-    steps_per_epoch = min(MAX_STEPS_PER_EPOCH, max_possible_steps)
-    total_steps = EPOCHS * steps_per_epoch
+        if config is not None and config != MODEL_CONFIG:
+            raise ValueError(
+                "Checkpoint architecture does not match this script.\n"
+                f"Checkpoint: {config}\n"
+                f"Current: {MODEL_CONFIG}"
+            )
 
-    print("\nTrain pairs:", len(train_pairs))
-    print("Validation pairs:", len(val_pairs))
-    print("Test pairs:", len(test_pairs))
-    print("Steps per epoch:", steps_per_epoch)
-    print("Total planned optimizer steps:", total_steps)
+        params = payload["params"]
+    else:
+        params = payload
+        payload = {"params": params, "epoch": None, "val_loss": None}
 
-    # --------------------------------------------------------
-    # MODEL
-    # --------------------------------------------------------
+    params = jax.tree_util.tree_map(jnp.asarray, params)
+    return params, payload
 
-    key = jax.random.PRNGKey(SEED)
-    params = init_fno(key)
-    nparams = count_parameters(params)
 
-    print("\nModel parameters:", f"{nparams:,}")
+def evaluate_pairs(
+    params, data, trajectory_ids, batch_size=BATCH_SIZE, pair_indices=None
+):
+    n_transitions = data.shape[1] - 1
+    total_pairs = len(trajectory_ids) * n_transitions
 
-    # --------------------------------------------------------
-    # OPTAX
-    # --------------------------------------------------------
+    if pair_indices is None:
+        pair_indices = np.arange(total_pairs, dtype=np.int64)
 
-    warmup_steps = max(1, int(total_steps * WARMUP_FRACTION))
+    errors = []
 
-    schedule = optax.warmup_cosine_decay_schedule(
-        init_value=1e-5,
-        peak_value=LEARNING_RATE,
-        warmup_steps=warmup_steps,
-        decay_steps=total_steps,
-        end_value=3e-5
+    for i in range(0, len(pair_indices), batch_size):
+        batch_ids = pair_indices[i:i + batch_size]
+        x, y = make_pair_batch(data, trajectory_ids, batch_ids, n_transitions)
+        e = eval_step(params, x, y)
+        errors.append(np.asarray(jax.device_get(e)))
+
+    return float(np.concatenate(errors).mean())
+
+
+@partial(jax.jit, static_argnames=("n_steps",))
+def rollout(params, omega0, n_steps):
+    def body(omega, _):
+        next_omega = fno(params, omega[None, ...])[0]
+        return next_omega, next_omega
+
+    _, future = lax.scan(body, omega0, None, length=n_steps)
+    return jnp.concatenate([omega0[None, ...], future], axis=0)
+
+
+def evaluate_rollouts(params, data, trajectory_ids, n_samples=1):
+    if len(trajectory_ids) == 0:
+        return None
+
+    selected = trajectory_ids[:min(n_samples, len(trajectory_ids))]
+    final_errors = []
+    mean_errors = []
+
+    for sample_id in selected:
+        truth = np.asarray(data[sample_id], dtype=np.float32)
+        pred = rollout(
+            params,
+            jnp.asarray(truth[0]),
+            n_steps=truth.shape[0] - 1,
+        )
+        pred = np.asarray(jax.device_get(pred), dtype=np.float32)
+
+        num = np.linalg.norm(pred - truth, axis=(1, 2))
+        den = np.linalg.norm(truth, axis=(1, 2)) + 1e-8
+        errors = num / den
+
+        mean_errors.append(float(errors[1:].mean()))
+        final_errors.append(float(errors[-1]))
+
+    return {
+        "mean_rel_l2": float(np.mean(mean_errors)),
+        "final_rel_l2": float(np.mean(final_errors)),
+    }
+
+
+def train(data, train_ids, val_ids, args):
+    if args.epochs < 1 or args.batch_size < 1:
+        raise ValueError("epochs and batch_size must be positive")
+
+    checkpoint_path = args.checkpoint
+    latest_path = checkpoint_path.with_name(
+        checkpoint_path.stem + "_latest" + checkpoint_path.suffix
+    )
+    history_path = checkpoint_path.with_name("history.json")
+    n_transitions = data.shape[1] - 1
+    n_train_pairs = len(train_ids) * n_transitions
+    n_val_pairs = len(val_ids) * n_transitions
+
+    if n_train_pairs == 0 or n_val_pairs == 0:
+        raise ValueError("Training and validation splits must not be empty")
+
+    pairs_per_epoch = min(args.pairs_per_epoch, n_train_pairs)
+    val_pairs = min(args.val_pairs, n_val_pairs)
+    steps_per_epoch = int(np.ceil(pairs_per_epoch / args.batch_size))
+    total_steps = args.epochs * steps_per_epoch
+
+    schedule = optax.cosine_decay_schedule(
+        args.lr,
+        total_steps,
     )
 
     optimizer = optax.chain(
-        optax.clip_by_global_norm(MAX_GRAD_NORM),
-        optax.adamw(
-            learning_rate=schedule,
-            b1=BETA1,
-            b2=BETA2,
-            eps=ADAM_EPS,
-            weight_decay=WEIGHT_DECAY
-        )
+        optax.clip_by_global_norm(GRAD_CLIP),
+        optax.adamw(schedule, weight_decay=WEIGHT_DECAY),
     )
 
-    optimizer_state = optimizer.init(params)
+    params = init_fno(jax.random.PRNGKey(args.seed))
+    opt_state = optimizer.init(params)
 
-    train_step = make_train_step(optimizer, grid)
-    validation_step = make_validation_step(grid)
-    predict_physical = make_predict_physical(grid)
-    autoregressive_rollout = make_rollout_fn(grid)
+    @jax.jit
+    def train_step(p, state, x, y):
+        def loss_fn(current_params):
+            pred = fno(current_params, x)
+            return rel_l2(pred, y).mean()
 
-    best_params = params
-    best_val_loss = float("inf")
-    best_epoch = 0
+        loss, grads = jax.value_and_grad(loss_fn)(p)
+        updates, state = optimizer.update(grads, state, p)
+        p = optax.apply_updates(p, updates)
 
-    patience_counter = 0
-    history = []
+        return p, state, loss
 
-    # --------------------------------------------------------
-    # TRAINING
-    # --------------------------------------------------------
-
-    print("\nStarting training...\n")
-
-    training_start = time.perf_counter()
-
-    for epoch in range(1, EPOCHS + 1):
-        epoch_start = time.perf_counter()
-
-        perm = rng.permutation(len(train_pairs))
-        selected_indices = perm[:steps_per_epoch * BATCH_SIZE]
-        epoch_pairs = train_pairs[selected_indices]
-
-        losses = []
-        grad_norms = []
-
-        for step_index in range(steps_per_epoch):
-            start = step_index * BATCH_SIZE
-            batch_pairs = epoch_pairs[start:start + BATCH_SIZE]
-
-            x, y = get_batch(data, batch_pairs)
-
-            params, optimizer_state, loss, grad_norm = train_step(
-                params,
-                optimizer_state,
-                x,
-                y,
-                data_mean,
-                data_std
-            )
-
-            losses.append(loss)
-            grad_norms.append(grad_norm)
-
-        train_loss = float(jax.device_get(jnp.mean(jnp.stack(losses))))
-        mean_grad_norm = float(jax.device_get(jnp.mean(jnp.stack(grad_norms))))
-
-        val_loss = evaluate_validation(
-            validation_step,
-            params,
-            data,
-            val_pairs,
-            data_mean,
-            data_std
-        )
-
-        epoch_elapsed = time.perf_counter() - epoch_start
-        current_lr = float(schedule((epoch - 1) * steps_per_epoch))
-
-        improved = val_loss < best_val_loss
-
-        if improved:
-            best_val_loss = val_loss
-            best_epoch = epoch
-            best_params = params
-            patience_counter = 0
-            save_params(best_params, OUTPUT_DIR / "best_fno_weights.npz")
-        else:
-            patience_counter += 1
-
-        epoch_result = {
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "validation_loss": val_loss,
-            "learning_rate": current_lr,
-            "mean_gradient_norm": mean_grad_norm,
-            "seconds": epoch_elapsed
-        }
-
-        history.append(epoch_result)
-
-        print(
-            f"Epoch {epoch:03d}/{EPOCHS} | "
-            f"train={train_loss:.6e} | "
-            f"val={val_loss:.6e} | "
-            f"lr={current_lr:.2e} | "
-            f"grad={mean_grad_norm:.3e} | "
-            f"time={epoch_elapsed:.1f}s | "
-            f"{'BEST' if improved else 'patience ' + str(patience_counter)}",
-            flush=True
-        )
-
-        if patience_counter >= PATIENCE:
-            print("\nEarly stopping triggered.")
-            break
-
-    jax.block_until_ready(best_params)
-    training_seconds = time.perf_counter() - training_start
-
-    print("\nTraining complete.")
-    print("Best epoch:", best_epoch)
-    print("Best validation loss:", best_val_loss)
-    print("Training time:", round(training_seconds, 2), "sec")
-
-    # --------------------------------------------------------
-    # ONE-STEP TEST
-    # --------------------------------------------------------
-
-    print("\nRunning one-step test on all test pairs...")
-
-    one_step_results = test_one_step(
-        predict_physical,
-        best_params,
-        data,
-        test_pairs,
-        data_mean,
-        data_std
+    rng = np.random.default_rng(args.seed)
+    val_rng = np.random.default_rng(args.seed + 1)
+    val_pair_indices = val_rng.choice(
+        n_val_pairs,
+        size=val_pairs,
+        replace=False,
     )
 
-    print("One-step relative L2:", one_step_results["relative_l2_mean"])
-    print(
-        "Persistence baseline:",
-        one_step_results["persistence_baseline_relative_l2_mean"]
-    )
-    print("One-step RMSE:", one_step_results["rmse"])
-    print("One-step MAE:", one_step_results["mae"])
-    print(
-        "Relative L2 / baseline:",
-        one_step_results["relative_l2_ratio_to_baseline"]
-    )
-
-    # --------------------------------------------------------
-    # ROLLOUT
-    # --------------------------------------------------------
-
-    print("\nRunning autoregressive rollout test...")
-
-    rollout_results, rollout_errors, baseline_errors = test_rollout(
-        autoregressive_rollout,
-        best_params,
-        data,
-        test_ids,
-        data_mean,
-        data_std,
-        n_transitions
-    )
-
-    for horizon, values in rollout_results["selected_horizons"].items():
-        print(
-            f"Horizon {int(horizon):3d} | "
-            f"FNO rel L2={values['fno_relative_l2_mean']:.6e} | "
-            f"Persistence={values['persistence_relative_l2_mean']:.6e}"
-        )
-
-    # --------------------------------------------------------
-    # SAVE RESULTS
-    # --------------------------------------------------------
-
-    results = {
-        "model": {
-            "name": "FNO-2D-Residual",
-            "resolution": [nx, ny],
-            "width": WIDTH,
-            "modes": MODES,
-            "layers": LAYERS,
-            "nparams": nparams,
-            "input": "normalized vorticity + x,y coordinates",
-            "target": "normalized vorticity increment",
-            "normalization_mean": float(data_mean_np),
-            "normalization_std": float(data_std_np),
-            "loss": "mean relative L2"
-        },
-        "training": {
-            "epochs_completed": len(history),
-            "best_epoch": best_epoch,
-            "best_validation_loss": best_val_loss,
-            "training_seconds": training_seconds,
-            "batch_size": BATCH_SIZE,
-            "steps_per_epoch": steps_per_epoch,
-            "learning_rate_initial": LEARNING_RATE,
-            "weight_decay": WEIGHT_DECAY,
-            "train_trajectories": int(len(train_ids)),
-            "validation_trajectories": int(len(val_ids)),
-            "test_trajectories": int(len(test_ids)),
-            "history": history
-        },
-        "one_step_test": one_step_results,
-        "autoregressive_rollout_test": rollout_results
+    history = {
+        "train_loss": [],
+        "val_loss": [],
+        "val_rollout_mean_rel_l2": [],
+        "val_rollout_final_rel_l2": [],
     }
 
-    with open(OUTPUT_DIR / "test_results.json", "w") as file:
-        json.dump(results, file, indent=4)
-
-    np.savez(
-        OUTPUT_DIR / "rollout_errors.npz",
-        fno=rollout_errors,
-        persistence=baseline_errors
-    )
-
-    # --------------------------------------------------------
-    # PLOTS
-    # --------------------------------------------------------
-
-    try:
-        import matplotlib.pyplot as plt
-
-        steps = np.arange(1, n_transitions + 1)
-        fno_mean = np.asarray(rollout_results["fno_relative_l2_mean_by_step"])
-        fno_std = np.asarray(rollout_results["fno_relative_l2_std_by_step"])
-        base_mean = np.asarray(
-            rollout_results["persistence_relative_l2_mean_by_step"]
-        )
-
-        plt.figure(figsize=(10, 5))
-        plt.plot(steps, fno_mean, label="FNO autoregressive")
-        plt.fill_between(
-            steps,
-            np.maximum(fno_mean - fno_std, 0.0),
-            fno_mean + fno_std,
-            alpha=0.2
-        )
-        plt.plot(steps, base_mean, label="Persistence baseline")
-        plt.xlabel("Prediction horizon")
-        plt.ylabel("Relative L2 error")
-        plt.title("FNO-2D autoregressive test")
-        plt.grid(True)
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(OUTPUT_DIR / "rollout_error.png", dpi=150)
-        plt.close()
-
-        epochs = [item["epoch"] for item in history]
-        train_losses = [item["train_loss"] for item in history]
-        val_losses = [item["validation_loss"] for item in history]
-
-        plt.figure(figsize=(10, 5))
-        plt.plot(epochs, train_losses, label="Train")
-        plt.plot(epochs, val_losses, label="Validation")
-        plt.xlabel("Epoch")
-        plt.ylabel("Relative L2")
-        plt.title("FNO-2D training history")
-        plt.grid(True)
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(OUTPUT_DIR / "training_history.png", dpi=150)
-        plt.close()
-
-    except ImportError:
-        print("Matplotlib not installed; plots skipped.")
-
-    # --------------------------------------------------------
-    # CONFIG
-    # --------------------------------------------------------
-
-    config = {
-        "data_dir": str(DATA_DIR),
-        "output_dir": str(OUTPUT_DIR),
-        "seed": SEED,
-        "resolution": [nx, ny],
-        "width": WIDTH,
-        "modes": MODES,
-        "layers": LAYERS,
-        "nparams": nparams,
-        "batch_size": BATCH_SIZE,
-        "epochs_limit": EPOCHS,
-        "steps_per_epoch": steps_per_epoch,
-        "learning_rate": LEARNING_RATE,
-        "weight_decay": WEIGHT_DECAY,
-        "warmup_fraction": WARMUP_FRACTION,
-        "patience": PATIENCE,
-        "loss": "mean relative L2",
-        "dataset_shape": list(data.shape),
-        "device_backend": jax.default_backend(),
-        "devices": [str(device) for device in jax.devices()]
-    }
-
-    with open(OUTPUT_DIR / "training_config.json", "w") as file:
-        json.dump(config, file, indent=4)
-
-    # --------------------------------------------------------
-    # FINAL SUMMARY
-    # --------------------------------------------------------
+    best_val = np.inf
+    start_time = time.perf_counter()
 
     print("\n" + "=" * 65)
-    print("FNO TRAINING AND TESTING COMPLETE")
+    print("2D NAVIER-STOKES FNO TRAINING")
     print("=" * 65)
-    print("Parameters:", f"{nparams:,}")
-    print("Best epoch:", best_epoch)
-    print("Best validation loss:", best_val_loss)
-    print("Training time:", round(training_seconds, 2), "sec")
-    print("One-step relative L2:", one_step_results["relative_l2_mean"])
-    print(
-        "Rollout final relative L2:",
-        rollout_results["final_horizon_relative_l2_mean"]
+    print("JAX backend:", jax.default_backend())
+    print("JAX devices:", jax.devices())
+    print("Dataset shape:", data.shape)
+    print("Grid:", data.shape[-2:])
+    print("Train trajectories:", len(train_ids))
+    print("Validation trajectories:", len(val_ids))
+    print("Pairs per epoch:", pairs_per_epoch)
+    print("Batch size:", args.batch_size)
+    print("Steps per epoch:", steps_per_epoch)
+    print("Total planned optimizer steps:", total_steps)
+    print("Model parameters:", sum(x.size for x in jax.tree_util.tree_leaves(params)))
+    print("=" * 65 + "\n")
+
+    for ep in range(args.epochs):
+        epoch_start = time.perf_counter()
+        pair_indices = rng.choice(
+            n_train_pairs,
+            size=pairs_per_epoch,
+            replace=False,
+        )
+
+        train_losses = []
+
+        for i in range(0, pairs_per_epoch, args.batch_size):
+            batch_ids = pair_indices[i:i + args.batch_size]
+            x, y = make_pair_batch(
+                data,
+                train_ids,
+                batch_ids,
+                n_transitions,
+            )
+
+            params, opt_state, loss = train_step(params, opt_state, x, y)
+            loss.block_until_ready()
+            train_losses.append(float(loss))
+
+        train_loss = float(np.mean(train_losses))
+        val_loss = evaluate_pairs(
+            params,
+            data,
+            val_ids,
+            batch_size=args.batch_size,
+            pair_indices=val_pair_indices,
+        )
+
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+
+        is_best = val_loss < best_val
+
+        if is_best:
+            best_val = val_loss
+            save_checkpoint(
+                checkpoint_path,
+                params,
+                ep + 1,
+                best_val,
+                history,
+            )
+
+        save_checkpoint(
+            latest_path,
+            params,
+            ep + 1,
+            val_loss,
+            history,
+        )
+
+        rollout_stats = None
+
+        if (ep + 1) % ROLLOUT_CHECK_EVERY == 0:
+            rollout_stats = evaluate_rollouts(
+                params,
+                data,
+                val_ids,
+                n_samples=ROLLOUT_VAL_SAMPLES,
+            )
+
+        if rollout_stats is None:
+            history["val_rollout_mean_rel_l2"].append(None)
+            history["val_rollout_final_rel_l2"].append(None)
+        else:
+            history["val_rollout_mean_rel_l2"].append(
+                rollout_stats["mean_rel_l2"]
+            )
+            history["val_rollout_final_rel_l2"].append(
+                rollout_stats["final_rel_l2"]
+            )
+
+        lr_now = float(schedule(jnp.asarray(ep * steps_per_epoch)))
+        elapsed = time.perf_counter() - epoch_start
+        status = " | BEST" if is_best else ""
+        rollout_text = ""
+
+        if rollout_stats is not None:
+            rollout_text = (
+                f" | rollout mean={rollout_stats['mean_rel_l2']:.4e}"
+                f" final={rollout_stats['final_rel_l2']:.4e}"
+            )
+
+        print(
+            f"Epoch {ep + 1:03d}/{args.epochs}"
+            f" | train={train_loss:.6e}"
+            f" | val={val_loss:.6e}"
+            f" | lr={lr_now:.2e}"
+            f" | time={elapsed:.1f}s"
+            f"{rollout_text}{status}",
+            flush=True,
+        )
+
+    total_time = time.perf_counter() - start_time
+
+    with open(history_path, "w") as f:
+        json.dump(history, f, indent=2)
+
+    params, checkpoint = load_checkpoint(checkpoint_path)
+
+    print("\nTraining complete.")
+    print("Best epoch:", checkpoint["epoch"])
+    print("Best validation loss:", checkpoint["val_loss"])
+    print("Training time:", round(total_time, 2), "sec")
+    print("Best checkpoint:", checkpoint_path)
+    print("Latest checkpoint:", latest_path)
+
+    return params
+
+
+def run_trajectory(
+    params, data, split_ids, split_name, trajectory, output_dir, data_dir
+):
+    if trajectory < 0 or trajectory >= len(split_ids):
+        raise IndexError(
+            f"Trajectory index {trajectory} is out of range for split "
+            f"'{split_name}' with {len(split_ids)} trajectories"
+        )
+
+    sample_id = int(split_ids[trajectory])
+    truth = np.asarray(data[sample_id], dtype=np.float32)
+    n_steps = truth.shape[0] - 1
+    omega0 = jnp.asarray(truth[0])
+
+    start = time.perf_counter()
+    pred = rollout(params, omega0, n_steps=n_steps)
+    pred.block_until_ready()
+    compile_time = time.perf_counter() - start
+
+    start = time.perf_counter()
+    pred = rollout(params, omega0, n_steps=n_steps)
+    pred.block_until_ready()
+    infer_time = time.perf_counter() - start
+
+    pred = np.asarray(jax.device_get(pred), dtype=np.float32)
+
+    num = np.linalg.norm(pred - truth, axis=(1, 2))
+    den = np.linalg.norm(truth, axis=(1, 2)) + 1e-8
+    errors = num / den
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    prefix = f"{split_name}_{trajectory:03d}_sample_{sample_id:03d}"
+
+    np.save(output_dir / f"{prefix}_prediction.npy", pred)
+    np.save(output_dir / f"{prefix}_reference.npy", truth)
+    np.save(output_dir / f"{prefix}_errors.npy", errors.astype(np.float32))
+
+    times_path = data_dir / "times.npy"
+
+    if times_path.exists():
+        times = np.load(times_path)
+    else:
+        times = np.arange(truth.shape[0], dtype=np.float32) * 0.01
+
+    np.save(output_dir / f"{prefix}_times.npy", times)
+
+    print("\nAutoregressive rollout complete.")
+    print("Split:", split_name)
+    print("Trajectory index in split:", trajectory)
+    print("Dataset sample id:", sample_id)
+    print("Prediction shape:", pred.shape)
+    print("Compilation + first run:", round(compile_time, 3), "sec")
+    print("Rollout time after JIT:", round(infer_time, 4), "sec")
+    print("Mean relative L2:", float(errors[1:].mean()))
+    print("Final relative L2:", float(errors[-1]))
+    print("Maximum relative L2:", float(errors.max()))
+    print("Saved to:", output_dir)
+
+
+def evaluate_model(params, data, val_ids, test_ids, batch_size):
+    print("\nEvaluating one-step prediction...")
+
+    val_loss = evaluate_pairs(
+        params,
+        data,
+        val_ids,
+        batch_size=batch_size,
     )
-    print("Results directory:", OUTPUT_DIR)
-    print("Saved: best_fno_weights.npz")
-    print("Saved: test_results.json")
-    print("Saved: training_config.json")
-    print("Saved: rollout_errors.npz")
-    print("Saved: rollout_error.png")
-    print("Saved: training_history.png")
+
+    test_loss = evaluate_pairs(
+        params,
+        data,
+        test_ids,
+        batch_size=batch_size,
+    )
+
+    print("Validation one-step relative L2:", val_loss)
+    print("Test one-step relative L2:", test_loss)
+
+    print("\nEvaluating autoregressive rollouts...")
+
+    val_rollout = evaluate_rollouts(params, data, val_ids, n_samples=3)
+    test_rollout = evaluate_rollouts(params, data, test_ids, n_samples=3)
+
+    print("Validation rollout:", val_rollout)
+    print("Test rollout:", test_rollout)
+
+    results = {
+        "val_one_step_rel_l2": val_loss,
+        "test_one_step_rel_l2": test_loss,
+        "val_rollout": val_rollout,
+        "test_rollout": test_rollout,
+    }
+
+    with open(BASE_DIR / "evaluation.json", "w") as f:
+        json.dump(results, f, indent=2)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "mode",
+        nargs="?",
+        choices=("train", "evaluate", "run"),
+        default="train",
+    )
+    parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
+    parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT_PATH)
+    parser.add_argument("--epochs", type=int, default=EPOCHS)
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--pairs-per-epoch", type=int, default=PAIRS_PER_EPOCH)
+    parser.add_argument("--val-pairs", type=int, default=VAL_PAIRS_PER_EPOCH)
+    parser.add_argument("--lr", type=float, default=LEARNING_RATE)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--split", choices=("train", "val", "test"), default="test")
+    parser.add_argument("--trajectory", type=int, default=0)
+    parser.add_argument("--output-dir", type=Path, default=BASE_DIR / "predictions")
+
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    data, train_ids, val_ids, test_ids = load_dataset(args.data_dir)
+
+    if args.mode == "train":
+        params = train(data, train_ids, val_ids, args)
+        evaluate_model(params, data, val_ids, test_ids, args.batch_size)
+
+    else:
+        params, checkpoint = load_checkpoint(args.checkpoint)
+        print("Loaded checkpoint:", args.checkpoint)
+        print("Checkpoint epoch:", checkpoint.get("epoch"))
+        print("Checkpoint validation loss:", checkpoint.get("val_loss"))
+
+        if args.mode == "evaluate":
+            evaluate_model(params, data, val_ids, test_ids, args.batch_size)
+
+        elif args.mode == "run":
+            split_ids = {
+                "train": train_ids,
+                "val": val_ids,
+                "test": test_ids,
+            }[args.split]
+
+            run_trajectory(
+                params,
+                data,
+                split_ids,
+                args.split,
+                args.trajectory,
+                args.output_dir,
+                args.data_dir,
+            )
 
 
 if __name__ == "__main__":
