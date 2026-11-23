@@ -12,37 +12,42 @@ import optax
 from jax import lax
 
 
-DATA_DIR = Path("dataset_ns_128")
-OUTPUT_DIR = Path("fno_ns_results")
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+DATA_DIR = Path("dataset_ns_256")
+OUTPUT_DIR = Path("fno_ns_results_256")
 
 SEED = 42
 
 WIDTH = 32
-MODES = 16
+MODES = 24
 LAYERS = 4
 
-BATCH_SIZE = 8
-EPOCHS = 40
-STEPS_PER_EPOCH = 300
-VAL_PAIRS = 512
-PATIENCE = 8
+BATCH_SIZE = 2
+TEST_BATCH_SIZE = 2
 
-LEARNING_RATE = 1e-3
+EPOCHS = 100
+STEPS_PER_EPOCH = 300
+PATIENCE = 15
+
+LEARNING_RATE = 3e-4
 WEIGHT_DECAY = 1e-4
-MAX_GRAD_NORM = 1.0
+WARMUP_FRACTION = 0.05
 
 BETA1 = 0.9
 BETA2 = 0.999
 ADAM_EPS = 1e-8
 
-TEST_BATCH_SIZE = 8
+MAX_GRAD_NORM = 1.0
+
 ROLLOUT_HORIZONS = [1, 10, 25, 50, 100]
 
 
 # ============================================================
 # FNO MODEL
 # ============================================================
-
 
 def init_dense(key, in_features, out_features):
     limit = math.sqrt(6.0 / (in_features + out_features))
@@ -72,7 +77,8 @@ def init_fno(key):
     keys = jax.random.split(key, 2 + LAYERS * 4 + 4)
     index = 0
 
-    lift_w, lift_b = init_dense(keys[index], 1, WIDTH)
+    # Vorticity + x + y coordinates
+    lift_w, lift_b = init_dense(keys[index], 3, WIDTH)
     index += 1
 
     layers = []
@@ -93,7 +99,9 @@ def init_fno(key):
         index += 1
 
         local_w, local_b = init_dense(
-            keys[index], WIDTH, WIDTH
+            keys[index],
+            WIDTH,
+            WIDTH
         )
         index += 1
 
@@ -105,13 +113,18 @@ def init_fno(key):
         })
 
     proj1_w, proj1_b = init_dense(
-        keys[index], WIDTH, WIDTH * 2
+        keys[index],
+        WIDTH,
+        WIDTH * 2
     )
     index += 1
 
-    proj2_w, proj2_b = init_dense(
-        keys[index], WIDTH * 2, 1
+    # Initially predict zero increment
+    proj2_w = jnp.zeros(
+        (WIDTH * 2, 1),
+        dtype=jnp.float32
     )
+    proj2_b = jnp.zeros((1,), dtype=jnp.float32)
 
     return {
         "lift_w": lift_w,
@@ -131,7 +144,10 @@ def dense(x, weight, bias):
 def spectral_conv(x, w_pos, w_neg):
     batch, nx, ny, channels = x.shape
 
-    x_ft = jnp.fft.rfft2(x, axes=(1, 2))
+    x_ft = jnp.fft.rfft2(
+        x,
+        axes=(1, 2)
+    )
 
     out_ft = jnp.zeros(
         (batch, nx, ny // 2 + 1, channels),
@@ -160,13 +176,52 @@ def spectral_conv(x, w_pos, w_neg):
     )
 
 
+def make_grid(nx, ny):
+    grid_x = jnp.linspace(
+        0.0, 1.0, nx,
+        endpoint=False,
+        dtype=jnp.float32
+    )
+
+    grid_y = jnp.linspace(
+        0.0, 1.0, ny,
+        endpoint=False,
+        dtype=jnp.float32
+    )
+
+    gx, gy = jnp.meshgrid(
+        grid_x,
+        grid_y,
+        indexing="ij"
+    )
+
+    return jnp.stack([gx, gy], axis=-1)
+
+
 def fno_apply(params, x):
+    batch, nx, ny, channels = x.shape
+
+    grid = make_grid(nx, ny)
+
+    grid = jnp.broadcast_to(
+        grid[None, ...],
+        (batch, nx, ny, 2)
+    )
+
+    # Add spatial coordinates
+    x = jnp.concatenate(
+        [x, grid],
+        axis=-1
+    )
+
+    # Lifting
     x = dense(
         x,
         params["lift_w"],
         params["lift_b"]
     )
 
+    # Residual Fourier blocks
     for layer in params["layers"]:
         spectral = spectral_conv(
             x,
@@ -180,8 +235,11 @@ def fno_apply(params, x):
             layer["local_b"]
         )
 
-        x = jax.nn.gelu(spectral + local)
+        update = jax.nn.gelu(spectral + local)
 
+        x = x + 0.1 * update
+
+    # Projection
     x = jax.nn.gelu(
         dense(
             x,
@@ -190,11 +248,14 @@ def fno_apply(params, x):
         )
     )
 
-    return dense(
+    # Predict normalized increment
+    delta = dense(
         x,
         params["proj2_w"],
         params["proj2_b"]
     )
+
+    return delta
 
 
 def count_parameters(params):
@@ -210,7 +271,6 @@ def count_parameters(params):
 # ============================================================
 # LOSS
 # ============================================================
-
 
 def relative_l2(prediction, target):
     error = prediction - target
@@ -229,9 +289,8 @@ def relative_l2(prediction, target):
 
 
 # ============================================================
-# OPTAX
+# OPTAX TRAINING
 # ============================================================
-
 
 def make_train_step(optimizer):
 
@@ -248,8 +307,13 @@ def make_train_step(optimizer):
         y_norm = (y - data_mean) / data_std
 
         def loss_function(current_params):
-            prediction = fno_apply(current_params, x_norm)
-            return jnp.mean(relative_l2(prediction, y_norm))
+            delta = fno_apply(current_params, x_norm)
+
+            prediction = x_norm + delta
+
+            return jnp.mean(
+                relative_l2(prediction, y_norm)
+            )
 
         loss, grads = jax.value_and_grad(loss_function)(params)
 
@@ -273,7 +337,7 @@ def validation_step(params, x, y, data_mean, data_std):
     x_norm = (x - data_mean) / data_std
     y_norm = (y - data_mean) / data_std
 
-    prediction = fno_apply(params, x_norm)
+    prediction = x_norm + fno_apply(params, x_norm)
 
     return jnp.mean(relative_l2(prediction, y_norm))
 
@@ -282,7 +346,9 @@ def validation_step(params, x, y, data_mean, data_std):
 def predict_physical(params, x, data_mean, data_std):
     x_norm = (x - data_mean) / data_std
 
-    prediction_norm = fno_apply(params, x_norm)
+    delta = fno_apply(params, x_norm)
+
+    prediction_norm = x_norm + delta
 
     return prediction_norm * data_std + data_mean
 
@@ -298,7 +364,10 @@ def autoregressive_rollout(
     state = (initial - data_mean) / data_std
 
     def body(current_state, _):
-        next_state = fno_apply(params, current_state)
+        delta = fno_apply(params, current_state)
+
+        next_state = current_state + delta
+
         return next_state, next_state
 
     _, predictions = lax.scan(
@@ -314,7 +383,6 @@ def autoregressive_rollout(
 # ============================================================
 # DATA HELPERS
 # ============================================================
-
 
 def make_pairs(sample_ids, n_transitions):
     return np.asarray(
@@ -338,7 +406,10 @@ def get_batch(data, pairs):
         dtype=np.float32
     )
 
-    return jnp.asarray(x[..., None]), jnp.asarray(y[..., None])
+    return (
+        jnp.asarray(x[..., None]),
+        jnp.asarray(y[..., None])
+    )
 
 
 def calculate_normalization(data, train_ids):
@@ -353,7 +424,7 @@ def calculate_normalization(data, train_ids):
         )
 
         total_sum += float(np.sum(trajectory))
-        total_squared_sum += float(np.sum(trajectory * trajectory))
+        total_squared_sum += float(np.sum(trajectory ** 2))
         total_count += trajectory.size
 
     data_mean = total_sum / total_count
@@ -386,7 +457,8 @@ def evaluate_validation(
     data_mean,
     data_std
 ):
-    losses = []
+    total_loss = 0.0
+    total_samples = 0
 
     for start in range(0, len(pairs), BATCH_SIZE):
         batch_pairs = pairs[start:start + BATCH_SIZE]
@@ -401,17 +473,17 @@ def evaluate_validation(
             data_std
         )
 
-        losses.append(loss)
+        batch_count = len(batch_pairs)
 
-    return float(
-        jax.device_get(jnp.mean(jnp.stack(losses)))
-    )
+        total_loss += float(jax.device_get(loss)) * batch_count
+        total_samples += batch_count
+
+    return total_loss / total_samples
 
 
 # ============================================================
 # ONE-STEP TEST
 # ============================================================
-
 
 def test_one_step(
     params,
@@ -425,9 +497,9 @@ def test_one_step(
 
     squared_error_sum = 0.0
     absolute_error_sum = 0.0
-    element_count = 0
-
     baseline_squared_error_sum = 0.0
+
+    element_count = 0
 
     for start in range(0, len(pairs), TEST_BATCH_SIZE):
         batch_pairs = pairs[start:start + TEST_BATCH_SIZE]
@@ -518,9 +590,8 @@ def test_one_step(
 
 
 # ============================================================
-# AUTOREGRESSIVE TEST
+# AUTOREGRESSIVE ROLLOUT TEST
 # ============================================================
-
 
 def test_rollout(
     params,
@@ -636,7 +707,6 @@ def test_rollout(
 # MAIN
 # ============================================================
 
-
 def main():
     if not DATA_DIR.exists():
         raise FileNotFoundError(
@@ -663,13 +733,15 @@ def main():
 
     n_samples, n_snapshots, nx, ny = data.shape
 
-    if nx != ny:
+    if nx != 256 or ny != 256:
         raise ValueError(
-            "This FNO implementation expects square spatial grids"
+            f"Expected 256x256 dataset, received {nx}x{ny}"
         )
 
     if 2 * MODES >= nx or MODES > ny // 2 + 1:
-        raise ValueError("MODES is too large for dataset resolution")
+        raise ValueError(
+            "MODES is too large for dataset resolution"
+        )
 
     if n_snapshots - 1 < max(ROLLOUT_HORIZONS):
         raise ValueError(
@@ -680,7 +752,11 @@ def main():
     val_ids = np.load(val_path).astype(np.int32)
     test_ids = np.load(test_path).astype(np.int32)
 
-    all_ids = np.concatenate([train_ids, val_ids, test_ids])
+    all_ids = np.concatenate([
+        train_ids,
+        val_ids,
+        test_ids
+    ])
 
     if len(np.unique(all_ids)) != n_samples:
         raise ValueError(
@@ -691,6 +767,13 @@ def main():
         raise ValueError(
             "Dataset split sizes do not match number of samples"
         )
+
+    if (
+        len(train_ids) == 0
+        or len(val_ids) == 0
+        or len(test_ids) == 0
+    ):
+        raise ValueError("Train, validation and test splits must be nonempty")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -706,6 +789,7 @@ def main():
     print("Validation trajectories:", len(val_ids))
     print("Test trajectories:", len(test_ids))
 
+    print("Resolution:", f"{nx}x{ny}")
     print("FNO width:", WIDTH)
     print("FNO modes:", MODES)
     print("FNO layers:", LAYERS)
@@ -737,26 +821,16 @@ def main():
     print("Data std:", float(data_std_np))
 
     # --------------------------------------------------------
-    # TEMPORAL PAIRS
+    # DATA PAIRS
     # --------------------------------------------------------
 
     n_transitions = n_snapshots - 1
 
     train_pairs = make_pairs(train_ids, n_transitions)
-    val_pairs_full = make_pairs(val_ids, n_transitions)
+    val_pairs = make_pairs(val_ids, n_transitions)
     test_pairs = make_pairs(test_ids, n_transitions)
 
     rng = np.random.default_rng(SEED)
-
-    val_count = min(VAL_PAIRS, len(val_pairs_full))
-
-    val_selection = rng.choice(
-        len(val_pairs_full),
-        size=val_count,
-        replace=False
-    )
-
-    val_pairs = val_pairs_full[val_selection]
 
     steps_per_epoch = min(
         STEPS_PER_EPOCH,
@@ -766,19 +840,20 @@ def main():
     if steps_per_epoch < 1:
         raise ValueError("Not enough training pairs for one batch")
 
-    total_optimizer_steps = EPOCHS * steps_per_epoch
+    total_steps = EPOCHS * steps_per_epoch
 
-    print("Train pairs:", len(train_pairs))
+    print("\nTrain pairs:", len(train_pairs))
     print("Validation pairs:", len(val_pairs))
     print("Test pairs:", len(test_pairs))
     print("Steps per epoch:", steps_per_epoch)
-    print("Total planned optimizer steps:", total_optimizer_steps)
+    print("Total planned optimizer steps:", total_steps)
 
     # --------------------------------------------------------
     # MODEL
     # --------------------------------------------------------
 
     key = jax.random.PRNGKey(SEED)
+
     params = init_fno(key)
 
     nparams = count_parameters(params)
@@ -786,13 +861,20 @@ def main():
     print("\nModel parameters:", f"{nparams:,}")
 
     # --------------------------------------------------------
-    # OPTAX OPTIMIZER
+    # OPTAX
     # --------------------------------------------------------
 
-    schedule = optax.cosine_decay_schedule(
-        init_value=LEARNING_RATE,
-        decay_steps=total_optimizer_steps,
-        alpha=0.01
+    warmup_steps = max(
+        1,
+        int(total_steps * WARMUP_FRACTION)
+    )
+
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=1e-5,
+        peak_value=LEARNING_RATE,
+        warmup_steps=warmup_steps,
+        decay_steps=total_steps,
+        end_value=3e-5
     )
 
     optimizer = optax.chain(
@@ -967,7 +1049,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # AUTOREGRESSIVE ROLLOUT
+    # ROLLOUT
     # --------------------------------------------------------
 
     print("\nRunning autoregressive rollout test...")
@@ -994,13 +1076,14 @@ def main():
 
     results = {
         "model": {
-            "name": "FNO-2D",
+            "name": "FNO-2D-Residual",
+            "resolution": [nx, ny],
             "width": WIDTH,
             "modes": MODES,
             "layers": LAYERS,
             "nparams": nparams,
-            "input": "vorticity at time t",
-            "target": "vorticity at time t + 0.01",
+            "input": "normalized vorticity + x,y coordinates",
+            "target": "normalized vorticity increment",
             "normalization_mean": float(data_mean_np),
             "normalization_std": float(data_std_np),
             "loss": "mean relative L2"
@@ -1031,6 +1114,10 @@ def main():
         fno=rollout_errors,
         persistence=baseline_errors
     )
+
+    # --------------------------------------------------------
+    # PLOTS
+    # --------------------------------------------------------
 
     try:
         import matplotlib.pyplot as plt
@@ -1084,13 +1171,39 @@ def main():
 
         plt.close()
 
+        epochs = [item["epoch"] for item in history]
+        train_losses = [item["train_loss"] for item in history]
+        val_losses = [item["validation_loss"] for item in history]
+
+        plt.figure(figsize=(10, 5))
+        plt.plot(epochs, train_losses, label="Train")
+        plt.plot(epochs, val_losses, label="Validation")
+        plt.xlabel("Epoch")
+        plt.ylabel("Relative L2")
+        plt.title("FNO-2D training history")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+
+        plt.savefig(
+            OUTPUT_DIR / "training_history.png",
+            dpi=150
+        )
+
+        plt.close()
+
     except ImportError:
-        print("Matplotlib not installed; rollout plot skipped.")
+        print("Matplotlib not installed; plots skipped.")
+
+    # --------------------------------------------------------
+    # CONFIG
+    # --------------------------------------------------------
 
     config = {
         "data_dir": str(DATA_DIR),
         "output_dir": str(OUTPUT_DIR),
         "seed": SEED,
+        "resolution": [nx, ny],
         "width": WIDTH,
         "modes": MODES,
         "layers": LAYERS,
@@ -1098,9 +1211,9 @@ def main():
         "batch_size": BATCH_SIZE,
         "epochs_limit": EPOCHS,
         "steps_per_epoch": steps_per_epoch,
-        "validation_pairs": int(len(val_pairs)),
         "learning_rate": LEARNING_RATE,
         "weight_decay": WEIGHT_DECAY,
+        "warmup_fraction": WARMUP_FRACTION,
         "patience": PATIENCE,
         "loss": "mean relative L2",
         "dataset_shape": list(data.shape),
@@ -1139,7 +1252,8 @@ def main():
     print("Saved: test_results.json")
     print("Saved: training_config.json")
     print("Saved: rollout_errors.npz")
-    print("Saved: rollout_error.png (if Matplotlib is installed)")
+    print("Saved: rollout_error.png")
+    print("Saved: training_history.png")
 
 
 if __name__ == "__main__":

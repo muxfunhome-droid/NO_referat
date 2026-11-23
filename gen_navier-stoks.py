@@ -9,7 +9,7 @@ import numpy as np
 from jax import lax
 
 
-N = 128
+N = 256
 nu = 1e-3
 n_steps = 1000
 
