@@ -1,3 +1,4 @@
+
 import json
 import math
 import time
@@ -7,6 +8,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 from jax import lax
 
 
@@ -26,10 +28,12 @@ VAL_PAIRS = 512
 PATIENCE = 8
 
 LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 1e-4
+MAX_GRAD_NORM = 1.0
+
 BETA1 = 0.9
 BETA2 = 0.999
 ADAM_EPS = 1e-8
-MAX_GRAD_NORM = 1.0
 
 TEST_BATCH_SIZE = 8
 ROLLOUT_HORIZONS = [1, 10, 25, 50, 100]
@@ -127,10 +131,7 @@ def dense(x, weight, bias):
 def spectral_conv(x, w_pos, w_neg):
     batch, nx, ny, channels = x.shape
 
-    x_ft = jnp.fft.rfft2(
-        x,
-        axes=(1, 2)
-    )
+    x_ft = jnp.fft.rfft2(x, axes=(1, 2))
 
     out_ft = jnp.zeros(
         (batch, nx, ny // 2 + 1, channels),
@@ -189,96 +190,82 @@ def fno_apply(params, x):
         )
     )
 
-    x = dense(
+    return dense(
         x,
         params["proj2_w"],
         params["proj2_b"]
     )
 
-    return x
+
+def count_parameters(params):
+    total = 0
+
+    for leaf in jax.tree_util.tree_leaves(params):
+        multiplier = 2 if jnp.iscomplexobj(leaf) else 1
+        total += leaf.size * multiplier
+
+    return int(total)
 
 
 # ============================================================
-# OPTIMIZER
+# LOSS
 # ============================================================
 
 
-def init_adam(params):
-    first_moment = jax.tree_util.tree_map(
-        jnp.zeros_like,
-        params
+def relative_l2(prediction, target):
+    error = prediction - target
+
+    error_norm = jnp.linalg.norm(
+        error.reshape(error.shape[0], -1),
+        axis=1
     )
 
-    second_moment = jax.tree_util.tree_map(
-        lambda p: jnp.zeros(p.shape, dtype=jnp.float32),
-        params
+    target_norm = jnp.linalg.norm(
+        target.reshape(target.shape[0], -1),
+        axis=1
     )
 
-    return first_moment, second_moment, jnp.array(0, dtype=jnp.int32)
+    return error_norm / jnp.maximum(target_norm, 1e-12)
 
 
-@jax.jit
-def train_step(
-    params,
-    first_moment,
-    second_moment,
-    step,
-    x,
-    y,
-    data_mean,
-    data_std,
-    learning_rate
-):
-    x_norm = (x - data_mean) / data_std
-    y_norm = (y - data_mean) / data_std
+# ============================================================
+# OPTAX
+# ============================================================
 
-    def loss_function(current_params):
-        prediction = fno_apply(current_params, x_norm)
-        return jnp.mean((prediction - y_norm) ** 2)
 
-    loss, grads = jax.value_and_grad(loss_function)(params)
+def make_train_step(optimizer):
 
-    grad_leaves = jax.tree_util.tree_leaves(grads)
-
-    grad_norm = jnp.sqrt(
-        sum(jnp.sum(jnp.abs(g) ** 2) for g in grad_leaves)
-    )
-
-    clip_scale = jnp.minimum(
-        1.0,
-        MAX_GRAD_NORM / (grad_norm + 1e-6)
-    )
-
-    grads = jax.tree_util.tree_map(
-        lambda g: g * clip_scale,
-        grads
-    )
-
-    step = step + 1
-
-    first_moment = jax.tree_util.tree_map(
-        lambda m, g: BETA1 * m + (1.0 - BETA1) * g,
-        first_moment,
-        grads
-    )
-
-    second_moment = jax.tree_util.tree_map(
-        lambda v, g: BETA2 * v + (1.0 - BETA2) * jnp.real(g * jnp.conj(g)),
-        second_moment,
-        grads
-    )
-
-    correction1 = 1.0 - BETA1 ** step
-    correction2 = 1.0 - BETA2 ** step
-
-    params = jax.tree_util.tree_map(
-        lambda p, m, v: p - learning_rate * (m / correction1) / (jnp.sqrt(v / correction2) + ADAM_EPS),
+    @jax.jit
+    def train_step(
         params,
-        first_moment,
-        second_moment
-    )
+        optimizer_state,
+        x,
+        y,
+        data_mean,
+        data_std
+    ):
+        x_norm = (x - data_mean) / data_std
+        y_norm = (y - data_mean) / data_std
 
-    return params, first_moment, second_moment, step, loss, grad_norm
+        def loss_function(current_params):
+            prediction = fno_apply(current_params, x_norm)
+            return jnp.mean(relative_l2(prediction, y_norm))
+
+        loss, grads = jax.value_and_grad(loss_function)(params)
+
+        grad_norm = optax.global_norm(grads)
+
+        updates, optimizer_state = optimizer.update(
+            grads,
+            optimizer_state,
+            params
+        )
+
+        params = optax.apply_updates(params, updates)
+
+        return params, optimizer_state, loss, grad_norm
+
+    return train_step
 
 
 @jax.jit
@@ -288,13 +275,15 @@ def validation_step(params, x, y, data_mean, data_std):
 
     prediction = fno_apply(params, x_norm)
 
-    return jnp.mean((prediction - y_norm) ** 2)
+    return jnp.mean(relative_l2(prediction, y_norm))
 
 
 @jax.jit
 def predict_physical(params, x, data_mean, data_std):
     x_norm = (x - data_mean) / data_std
+
     prediction_norm = fno_apply(params, x_norm)
+
     return prediction_norm * data_std + data_mean
 
 
@@ -368,7 +357,12 @@ def calculate_normalization(data, train_ids):
         total_count += trajectory.size
 
     data_mean = total_sum / total_count
-    variance = total_squared_sum / total_count - data_mean**2
+
+    variance = (
+        total_squared_sum / total_count
+        - data_mean ** 2
+    )
+
     data_std = math.sqrt(max(variance, 1e-12))
 
     return np.float32(data_mean), np.float32(data_std)
@@ -385,14 +379,17 @@ def save_params(params, path):
     np.savez(path, **arrays)
 
 
-def evaluate_validation(params, data, pairs, data_mean, data_std):
+def evaluate_validation(
+    params,
+    data,
+    pairs,
+    data_mean,
+    data_std
+):
     losses = []
 
     for start in range(0, len(pairs), BATCH_SIZE):
         batch_pairs = pairs[start:start + BATCH_SIZE]
-
-        if len(batch_pairs) != BATCH_SIZE:
-            continue
 
         x, y = get_batch(data, batch_pairs)
 
@@ -406,18 +403,23 @@ def evaluate_validation(params, data, pairs, data_mean, data_std):
 
         losses.append(loss)
 
-    if not losses:
-        raise RuntimeError("Validation set does not contain a full batch")
-
-    return float(jax.device_get(jnp.mean(jnp.stack(losses))))
+    return float(
+        jax.device_get(jnp.mean(jnp.stack(losses)))
+    )
 
 
 # ============================================================
-# TESTING
+# ONE-STEP TEST
 # ============================================================
 
 
-def test_one_step(params, data, pairs, data_mean, data_std):
+def test_one_step(
+    params,
+    data,
+    pairs,
+    data_mean,
+    data_std
+):
     relative_errors = []
     baseline_relative_errors = []
 
@@ -439,9 +441,17 @@ def test_one_step(params, data, pairs, data_mean, data_std):
             data_std
         )
 
-        prediction = np.asarray(jax.device_get(prediction))[..., 0]
-        x_np = np.asarray(jax.device_get(x))[..., 0]
-        y_np = np.asarray(jax.device_get(y))[..., 0]
+        prediction = np.asarray(
+            jax.device_get(prediction)
+        )[..., 0]
+
+        x_np = np.asarray(
+            jax.device_get(x)
+        )[..., 0]
+
+        y_np = np.asarray(
+            jax.device_get(y)
+        )[..., 0]
 
         error = prediction - y_np
         baseline_error = x_np - y_np
@@ -463,29 +473,63 @@ def test_one_step(params, data, pairs, data_mean, data_std):
 
         denominator = np.maximum(target_norm, 1e-12)
 
-        relative_errors.extend((pred_norm / denominator).tolist())
-        baseline_relative_errors.extend((base_norm / denominator).tolist())
+        relative_errors.extend(
+            (pred_norm / denominator).tolist()
+        )
 
-        squared_error_sum += float(np.sum(error**2))
+        baseline_relative_errors.extend(
+            (base_norm / denominator).tolist()
+        )
+
+        squared_error_sum += float(np.sum(error ** 2))
         absolute_error_sum += float(np.sum(np.abs(error)))
-        baseline_squared_error_sum += float(np.sum(baseline_error**2))
+
+        baseline_squared_error_sum += float(
+            np.sum(baseline_error ** 2)
+        )
+
         element_count += error.size
 
     return {
         "pairs": int(len(relative_errors)),
-        "rmse": float(math.sqrt(squared_error_sum / element_count)),
-        "mae": float(absolute_error_sum / element_count),
-        "relative_l2_mean": float(np.mean(relative_errors)),
-        "relative_l2_std": float(np.std(relative_errors)),
-        "persistence_baseline_rmse": float(math.sqrt(baseline_squared_error_sum / element_count)),
-        "persistence_baseline_relative_l2_mean": float(np.mean(baseline_relative_errors)),
+        "rmse": float(
+            math.sqrt(squared_error_sum / element_count)
+        ),
+        "mae": float(
+            absolute_error_sum / element_count
+        ),
+        "relative_l2_mean": float(
+            np.mean(relative_errors)
+        ),
+        "relative_l2_std": float(
+            np.std(relative_errors)
+        ),
+        "persistence_baseline_rmse": float(
+            math.sqrt(baseline_squared_error_sum / element_count)
+        ),
+        "persistence_baseline_relative_l2_mean": float(
+            np.mean(baseline_relative_errors)
+        ),
         "relative_l2_ratio_to_baseline": float(
-            np.mean(relative_errors) / max(np.mean(baseline_relative_errors), 1e-12)
+            np.mean(relative_errors)
+            / max(np.mean(baseline_relative_errors), 1e-12)
         )
     }
 
 
-def test_rollout(params, data, test_ids, data_mean, data_std, n_steps):
+# ============================================================
+# AUTOREGRESSIVE TEST
+# ============================================================
+
+
+def test_rollout(
+    params,
+    data,
+    test_ids,
+    data_mean,
+    data_std,
+    n_steps
+):
     model_errors = []
     baseline_errors = []
 
@@ -500,7 +544,9 @@ def test_rollout(params, data, test_ids, data_mean, data_std, n_steps):
             dtype=np.float32
         )
 
-        initial = jnp.asarray(initial_np[None, :, :, None])
+        initial = jnp.asarray(
+            initial_np[None, :, :, None]
+        )
 
         prediction = autoregressive_rollout(
             params,
@@ -521,7 +567,9 @@ def test_rollout(params, data, test_ids, data_mean, data_std, n_steps):
             true_trajectory.shape
         )
 
-        baseline_difference = baseline_prediction - true_trajectory
+        baseline_difference = (
+            baseline_prediction - true_trajectory
+        )
 
         target_norm = np.linalg.norm(
             true_trajectory.reshape(n_steps, -1),
@@ -548,6 +596,7 @@ def test_rollout(params, data, test_ids, data_mean, data_std, n_steps):
 
     model_mean = np.mean(model_errors, axis=0)
     model_std = np.std(model_errors, axis=0)
+
     baseline_mean = np.mean(baseline_errors, axis=0)
     baseline_std = np.std(baseline_errors, axis=0)
 
@@ -559,8 +608,12 @@ def test_rollout(params, data, test_ids, data_mean, data_std, n_steps):
         selected_horizons[str(horizon)] = {
             "fno_relative_l2_mean": float(model_mean[index]),
             "fno_relative_l2_std": float(model_std[index]),
-            "persistence_relative_l2_mean": float(baseline_mean[index]),
-            "persistence_relative_l2_std": float(baseline_std[index])
+            "persistence_relative_l2_mean": float(
+                baseline_mean[index]
+            ),
+            "persistence_relative_l2_std": float(
+                baseline_std[index]
+            )
         }
 
     return {
@@ -573,7 +626,9 @@ def test_rollout(params, data, test_ids, data_mean, data_std, n_steps):
         "persistence_relative_l2_std_by_step": baseline_std.tolist(),
         "final_horizon_relative_l2_mean": float(model_mean[-1]),
         "final_horizon_relative_l2_std": float(model_std[-1]),
-        "final_horizon_persistence_relative_l2_mean": float(baseline_mean[-1])
+        "final_horizon_persistence_relative_l2_mean": float(
+            baseline_mean[-1]
+        )
     }, model_errors, baseline_errors
 
 
@@ -584,7 +639,9 @@ def test_rollout(params, data, test_ids, data_mean, data_std, n_steps):
 
 def main():
     if not DATA_DIR.exists():
-        raise FileNotFoundError(f"Dataset directory not found: {DATA_DIR}")
+        raise FileNotFoundError(
+            f"Dataset directory not found: {DATA_DIR}"
+        )
 
     data_path = DATA_DIR / "trajectories.npy"
     train_path = DATA_DIR / "train_indices.npy"
@@ -593,42 +650,62 @@ def main():
 
     for path in [data_path, train_path, val_path, test_path]:
         if not path.exists():
-            raise FileNotFoundError(f"Required dataset file not found: {path}")
+            raise FileNotFoundError(
+                f"Required dataset file not found: {path}"
+            )
 
     data = np.load(data_path, mmap_mode="r")
 
     if data.ndim != 4:
-        raise ValueError(f"Expected 4D dataset, received shape {data.shape}")
+        raise ValueError(
+            f"Expected 4D dataset, received shape {data.shape}"
+        )
 
     n_samples, n_snapshots, nx, ny = data.shape
 
     if nx != ny:
-        raise ValueError("This FNO implementation expects square spatial grids")
+        raise ValueError(
+            "This FNO implementation expects square spatial grids"
+        )
 
     if 2 * MODES >= nx or MODES > ny // 2 + 1:
-        raise ValueError("MODES is too large for the dataset resolution")
+        raise ValueError("MODES is too large for dataset resolution")
+
+    if n_snapshots - 1 < max(ROLLOUT_HORIZONS):
+        raise ValueError(
+            "Not enough snapshots for requested rollout horizons"
+        )
 
     train_ids = np.load(train_path).astype(np.int32)
     val_ids = np.load(val_path).astype(np.int32)
     test_ids = np.load(test_path).astype(np.int32)
 
-    if len(np.unique(np.concatenate([train_ids, val_ids, test_ids]))) != n_samples:
-        raise ValueError("Dataset splits overlap or do not cover all trajectories")
+    all_ids = np.concatenate([train_ids, val_ids, test_ids])
 
-    if len(train_ids) + len(val_ids) + len(test_ids) != n_samples:
-        raise ValueError("Dataset split sizes do not match the number of samples")
+    if len(np.unique(all_ids)) != n_samples:
+        raise ValueError(
+            "Dataset splits overlap or do not cover all trajectories"
+        )
+
+    if len(all_ids) != n_samples:
+        raise ValueError(
+            "Dataset split sizes do not match number of samples"
+        )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     print("\n" + "=" * 65)
-    print("FNO TRAINING AND TESTING")
+    print("FNO-2D TRAINING AND TESTING")
     print("=" * 65)
+
     print("Backend:", jax.default_backend())
     print("Devices:", jax.devices())
     print("Dataset shape:", data.shape)
+
     print("Train trajectories:", len(train_ids))
     print("Validation trajectories:", len(val_ids))
     print("Test trajectories:", len(test_ids))
+
     print("FNO width:", WIDTH)
     print("FNO modes:", MODES)
     print("FNO layers:", LAYERS)
@@ -637,16 +714,31 @@ def main():
     if jax.default_backend() != "gpu":
         print("WARNING: JAX is not using a GPU backend.")
 
+    # --------------------------------------------------------
+    # NORMALIZATION
+    # --------------------------------------------------------
+
     data_mean_np, data_std_np = calculate_normalization(
         data,
         train_ids
     )
 
-    data_mean = jnp.asarray(data_mean_np, dtype=jnp.float32)
-    data_std = jnp.asarray(data_std_np, dtype=jnp.float32)
+    data_mean = jnp.asarray(
+        data_mean_np,
+        dtype=jnp.float32
+    )
+
+    data_std = jnp.asarray(
+        data_std_np,
+        dtype=jnp.float32
+    )
 
     print("Data mean:", float(data_mean_np))
     print("Data std:", float(data_std_np))
+
+    # --------------------------------------------------------
+    # TEMPORAL PAIRS
+    # --------------------------------------------------------
 
     n_transitions = n_snapshots - 1
 
@@ -657,23 +749,77 @@ def main():
     rng = np.random.default_rng(SEED)
 
     val_count = min(VAL_PAIRS, len(val_pairs_full))
+
     val_selection = rng.choice(
         len(val_pairs_full),
         size=val_count,
         replace=False
     )
+
     val_pairs = val_pairs_full[val_selection]
+
+    steps_per_epoch = min(
+        STEPS_PER_EPOCH,
+        len(train_pairs) // BATCH_SIZE
+    )
+
+    if steps_per_epoch < 1:
+        raise ValueError("Not enough training pairs for one batch")
+
+    total_optimizer_steps = EPOCHS * steps_per_epoch
+
+    print("Train pairs:", len(train_pairs))
+    print("Validation pairs:", len(val_pairs))
+    print("Test pairs:", len(test_pairs))
+    print("Steps per epoch:", steps_per_epoch)
+    print("Total planned optimizer steps:", total_optimizer_steps)
+
+    # --------------------------------------------------------
+    # MODEL
+    # --------------------------------------------------------
 
     key = jax.random.PRNGKey(SEED)
     params = init_fno(key)
 
-    first_moment, second_moment, optimizer_step = init_adam(params)
+    nparams = count_parameters(params)
+
+    print("\nModel parameters:", f"{nparams:,}")
+
+    # --------------------------------------------------------
+    # OPTAX OPTIMIZER
+    # --------------------------------------------------------
+
+    schedule = optax.cosine_decay_schedule(
+        init_value=LEARNING_RATE,
+        decay_steps=total_optimizer_steps,
+        alpha=0.01
+    )
+
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(MAX_GRAD_NORM),
+        optax.adamw(
+            learning_rate=schedule,
+            b1=BETA1,
+            b2=BETA2,
+            eps=ADAM_EPS,
+            weight_decay=WEIGHT_DECAY
+        )
+    )
+
+    optimizer_state = optimizer.init(params)
+
+    train_step = make_train_step(optimizer)
 
     best_params = params
     best_val_loss = float("inf")
     best_epoch = 0
+
     patience_counter = 0
     history = []
+
+    # --------------------------------------------------------
+    # TRAINING
+    # --------------------------------------------------------
 
     print("\nStarting training...\n")
 
@@ -682,10 +828,7 @@ def main():
     for epoch in range(1, EPOCHS + 1):
         epoch_start = time.perf_counter()
 
-        selected_count = min(
-            STEPS_PER_EPOCH * BATCH_SIZE,
-            len(train_pairs)
-        )
+        selected_count = steps_per_epoch * BATCH_SIZE
 
         selected_indices = rng.choice(
             len(train_pairs),
@@ -695,30 +838,25 @@ def main():
 
         epoch_pairs = train_pairs[selected_indices]
 
-        actual_steps = len(epoch_pairs) // BATCH_SIZE
         losses = []
         grad_norms = []
 
-        learning_rate = LEARNING_RATE * 0.5 * (
-            1.0 + math.cos(math.pi * (epoch - 1) / EPOCHS)
-        )
-
-        for step_index in range(actual_steps):
+        for step_index in range(steps_per_epoch):
             start = step_index * BATCH_SIZE
-            batch_pairs = epoch_pairs[start:start + BATCH_SIZE]
+
+            batch_pairs = epoch_pairs[
+                start:start + BATCH_SIZE
+            ]
 
             x, y = get_batch(data, batch_pairs)
 
-            params, first_moment, second_moment, optimizer_step, loss, grad_norm = train_step(
+            params, optimizer_state, loss, grad_norm = train_step(
                 params,
-                first_moment,
-                second_moment,
-                optimizer_step,
+                optimizer_state,
                 x,
                 y,
                 data_mean,
-                data_std,
-                jnp.asarray(learning_rate, dtype=jnp.float32)
+                data_std
             )
 
             losses.append(loss)
@@ -726,6 +864,10 @@ def main():
 
         train_loss = float(
             jax.device_get(jnp.mean(jnp.stack(losses)))
+        )
+
+        mean_grad_norm = float(
+            jax.device_get(jnp.mean(jnp.stack(grad_norms)))
         )
 
         val_loss = evaluate_validation(
@@ -737,6 +879,10 @@ def main():
         )
 
         epoch_elapsed = time.perf_counter() - epoch_start
+
+        current_lr = float(
+            schedule((epoch - 1) * steps_per_epoch)
+        )
 
         improved = val_loss < best_val_loss
 
@@ -757,10 +903,8 @@ def main():
             "epoch": epoch,
             "train_loss": train_loss,
             "validation_loss": val_loss,
-            "learning_rate": learning_rate,
-            "mean_gradient_norm": float(
-                jax.device_get(jnp.mean(jnp.stack(grad_norms)))
-            ),
+            "learning_rate": current_lr,
+            "mean_gradient_norm": mean_grad_norm,
             "seconds": epoch_elapsed
         }
 
@@ -770,14 +914,18 @@ def main():
             f"Epoch {epoch:03d}/{EPOCHS} | "
             f"train={train_loss:.6e} | "
             f"val={val_loss:.6e} | "
-            f"lr={learning_rate:.2e} | "
+            f"lr={current_lr:.2e} | "
+            f"grad={mean_grad_norm:.3e} | "
             f"time={epoch_elapsed:.1f}s | "
-            f"{'BEST' if improved else 'patience ' + str(patience_counter)}"
+            f"{'BEST' if improved else 'patience ' + str(patience_counter)}",
+            flush=True
         )
 
         if patience_counter >= PATIENCE:
-            print("Early stopping triggered.")
+            print("\nEarly stopping triggered.")
             break
+
+    jax.block_until_ready(best_params)
 
     training_seconds = time.perf_counter() - training_start
 
@@ -785,6 +933,10 @@ def main():
     print("Best epoch:", best_epoch)
     print("Best validation loss:", best_val_loss)
     print("Training time:", round(training_seconds, 2), "sec")
+
+    # --------------------------------------------------------
+    # ONE-STEP TEST
+    # --------------------------------------------------------
 
     print("\nRunning one-step test on all test pairs...")
 
@@ -796,10 +948,27 @@ def main():
         data_std
     )
 
-    print("One-step relative L2:", one_step_results["relative_l2_mean"])
-    print("Persistence baseline:", one_step_results["persistence_baseline_relative_l2_mean"])
+    print(
+        "One-step relative L2:",
+        one_step_results["relative_l2_mean"]
+    )
+
+    print(
+        "Persistence baseline:",
+        one_step_results["persistence_baseline_relative_l2_mean"]
+    )
+
     print("One-step RMSE:", one_step_results["rmse"])
     print("One-step MAE:", one_step_results["mae"])
+
+    print(
+        "Relative L2 / baseline:",
+        one_step_results["relative_l2_ratio_to_baseline"]
+    )
+
+    # --------------------------------------------------------
+    # AUTOREGRESSIVE ROLLOUT
+    # --------------------------------------------------------
 
     print("\nRunning autoregressive rollout test...")
 
@@ -819,16 +988,22 @@ def main():
             f"Persistence={values['persistence_relative_l2_mean']:.6e}"
         )
 
+    # --------------------------------------------------------
+    # SAVE RESULTS
+    # --------------------------------------------------------
+
     results = {
         "model": {
             "name": "FNO-2D",
             "width": WIDTH,
             "modes": MODES,
             "layers": LAYERS,
+            "nparams": nparams,
             "input": "vorticity at time t",
             "target": "vorticity at time t + 0.01",
             "normalization_mean": float(data_mean_np),
-            "normalization_std": float(data_std_np)
+            "normalization_std": float(data_std_np),
+            "loss": "mean relative L2"
         },
         "training": {
             "epochs_completed": len(history),
@@ -836,8 +1011,9 @@ def main():
             "best_validation_loss": best_val_loss,
             "training_seconds": training_seconds,
             "batch_size": BATCH_SIZE,
-            "steps_per_epoch_limit": STEPS_PER_EPOCH,
+            "steps_per_epoch": steps_per_epoch,
             "learning_rate_initial": LEARNING_RATE,
+            "weight_decay": WEIGHT_DECAY,
             "train_trajectories": int(len(train_ids)),
             "validation_trajectories": int(len(val_ids)),
             "test_trajectories": int(len(test_ids)),
@@ -860,39 +1036,56 @@ def main():
         import matplotlib.pyplot as plt
 
         steps = np.arange(1, n_transitions + 1)
+
         fno_mean = np.asarray(
             rollout_results["fno_relative_l2_mean_by_step"]
         )
+
         fno_std = np.asarray(
             rollout_results["fno_relative_l2_std_by_step"]
         )
+
         base_mean = np.asarray(
             rollout_results["persistence_relative_l2_mean_by_step"]
         )
 
         plt.figure(figsize=(10, 5))
-        plt.plot(steps, fno_mean, label="FNO autoregressive")
+
+        plt.plot(
+            steps,
+            fno_mean,
+            label="FNO autoregressive"
+        )
+
         plt.fill_between(
             steps,
             np.maximum(fno_mean - fno_std, 0.0),
             fno_mean + fno_std,
             alpha=0.2
         )
-        plt.plot(steps, base_mean, label="Persistence baseline")
+
+        plt.plot(
+            steps,
+            base_mean,
+            label="Persistence baseline"
+        )
+
         plt.xlabel("Prediction horizon")
         plt.ylabel("Relative L2 error")
         plt.title("FNO-2D autoregressive test")
         plt.grid(True)
         plt.legend()
         plt.tight_layout()
+
         plt.savefig(
             OUTPUT_DIR / "rollout_error.png",
             dpi=150
         )
+
         plt.close()
 
     except ImportError:
-        print("Matplotlib not installed; rollout plot was skipped.")
+        print("Matplotlib not installed; rollout plot skipped.")
 
     config = {
         "data_dir": str(DATA_DIR),
@@ -901,12 +1094,15 @@ def main():
         "width": WIDTH,
         "modes": MODES,
         "layers": LAYERS,
+        "nparams": nparams,
         "batch_size": BATCH_SIZE,
         "epochs_limit": EPOCHS,
-        "steps_per_epoch": STEPS_PER_EPOCH,
+        "steps_per_epoch": steps_per_epoch,
         "validation_pairs": int(len(val_pairs)),
         "learning_rate": LEARNING_RATE,
+        "weight_decay": WEIGHT_DECAY,
         "patience": PATIENCE,
+        "loss": "mean relative L2",
         "dataset_shape": list(data.shape),
         "device_backend": jax.default_backend(),
         "devices": [str(device) for device in jax.devices()]
@@ -915,13 +1111,29 @@ def main():
     with open(OUTPUT_DIR / "training_config.json", "w") as file:
         json.dump(config, file, indent=4)
 
+    # --------------------------------------------------------
+    # FINAL SUMMARY
+    # --------------------------------------------------------
+
     print("\n" + "=" * 65)
     print("FNO TRAINING AND TESTING COMPLETE")
     print("=" * 65)
+
+    print("Parameters:", f"{nparams:,}")
     print("Best epoch:", best_epoch)
     print("Best validation loss:", best_val_loss)
-    print("One-step relative L2:", one_step_results["relative_l2_mean"])
-    print("Rollout final relative L2:", rollout_results["final_horizon_relative_l2_mean"])
+    print("Training time:", round(training_seconds, 2), "sec")
+
+    print(
+        "One-step relative L2:",
+        one_step_results["relative_l2_mean"]
+    )
+
+    print(
+        "Rollout final relative L2:",
+        rollout_results["final_horizon_relative_l2_mean"]
+    )
+
     print("Results directory:", OUTPUT_DIR)
     print("Saved: best_fno_weights.npz")
     print("Saved: test_results.json")
