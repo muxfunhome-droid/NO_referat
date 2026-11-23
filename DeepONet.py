@@ -1,8 +1,9 @@
-import numpy as np
 from pathlib import Path
-import optax
+
 import jax
 import jax.numpy as jnp
+import numpy as np
+import optax
 
 BASE_DIR = Path(__file__).resolve().parent
 
